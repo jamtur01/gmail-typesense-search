@@ -10,38 +10,38 @@ client = typesense.Client({
     'connection_timeout_seconds': 2
 })
 
-# Optional: Delete the collection if you need to recreate it
-try:
-    client.collections['emails'].delete()
-    print("Deleted existing 'emails' collection.")
-except typesense.exceptions.TypesenseClientError as e:
-    if e.code == 'c4006':
-        print("Collection 'emails' does not exist. Proceeding to create a new one.")
-    else:
-        raise e
+#client.collections['emails'].delete()
+#print("Deleted existing 'emails' collection.")
 
 schema = {
     "name": "emails",
     "fields": [
-        {"name": "id", "type": "string"},  # Unique identifier set to message_id
+        {"name": "id", "type": "string"},
         {"name": "subject", "type": "string"},
         {"name": "sender", "type": "string", "facet": True},
         {"name": "recipients", "type": "string", "facet": True},
-        {"name": "date", "type": "int64", "facet": True},
+        {"name": "date", "type": "int64", "facet": True, "sort": True},
         {"name": "body", "type": "string"},
-        {"name": "labels", "type": "string[]", "facet": True},  # Array of labels
-        {"name": "thread_id", "type": "string"},  # Thread ID
-        {"name": "sentiment", "type": "string", "facet": True},  # Sentiment category
+        {"name": "labels", "type": "string[]", "facet": True, "optional": True},
+        {"name": "thread_id", "type": "string", "optional": True},
         {
             "name": "body_vector",
             "type": "float[]",
             "num_dim": 1536,
-            "embedding_source": "body",
-            "embedding_model": "openai_text_embedding_ada_002",
-            "optional": True
-        }
+            "optional": True,
+            "hnsw_params": {
+                "M": 16,
+                "ef_construction": 200
+            },
+            "vec_dist": "cosine"
+        },
+        {"name": "entities", "type": "object[]", "optional": True},  # Changed to object[]
+        {"name": "keywords", "type": "string[]", "optional": True},
+        {"name": "summary", "type": "string", "optional": True},
+        {"name": "intent", "type": "string", "facet": True, "optional": True}
     ],
-    "default_sorting_field": "date"
+    "default_sorting_field": "date",
+    "enable_nested_fields": True  # Added for object[] support
 }
 
 try:
