@@ -1,0 +1,11 @@
+# .gitignore
+venv/
+__pycache__/
+*.pyc
+.env
+credentials.json
+.DS_Store
+data
+typesense.sh
+node_modules
+
