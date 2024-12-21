@@ -8,4 +8,6 @@ credentials.json
 data
 typesense.sh
 node_modules
-
+token.pickle
+checkpoint.json
+indexing.log

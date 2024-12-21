@@ -1,29 +1,37 @@
 import typesense
 
 client = typesense.Client({
-  'nodes': [{
-    'host': 'localhost',
-    'port': '8108',
-    'protocol': 'http'
-  }],
-  'api_key': 'orion123',
-  'connection_timeout_seconds': 2
+    'nodes': [{
+        'host': 'localhost',
+        'port': '8108',
+        'protocol': 'http'
+    }],
+    'api_key': 'orion123',  # Replace with your actual Typesense API key
+    'connection_timeout_seconds': 2
 })
 
+# Optional: Delete the collection if you need to recreate it
 try:
     client.collections['emails'].delete()
-except:
-    pass
+    print("Deleted existing 'emails' collection.")
+except typesense.exceptions.TypesenseClientError as e:
+    if e.code == 'c4006':
+        print("Collection 'emails' does not exist. Proceeding to create a new one.")
+    else:
+        raise e
 
 schema = {
     "name": "emails",
     "fields": [
-        {"name": "message_id", "type": "string"},
+        {"name": "id", "type": "string"},  # Unique identifier set to message_id
         {"name": "subject", "type": "string"},
         {"name": "sender", "type": "string", "facet": True},
         {"name": "recipients", "type": "string", "facet": True},
         {"name": "date", "type": "int64", "facet": True},
         {"name": "body", "type": "string"},
+        {"name": "labels", "type": "string[]", "facet": True},  # Array of labels
+        {"name": "thread_id", "type": "string"},  # Thread ID
+        {"name": "sentiment", "type": "string", "facet": True},  # Sentiment category
         {
             "name": "body_vector",
             "type": "float[]",
@@ -36,5 +44,8 @@ schema = {
     "default_sorting_field": "date"
 }
 
-client.collections.create(schema)
-print("Collection 'emails' with vector field created.")
+try:
+    client.collections.create(schema)
+    print("Collection 'emails' with vector field created successfully.")
+except typesense.exceptions.TypesenseClientError as e:
+    print(f"Failed to create collection: {e}")
