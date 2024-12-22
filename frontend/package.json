@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "instantsearch.js": "^4.75.6",
+    "lodash": "^4.17.21",
     "typesense": "^1.8.2",
     "typesense-instantsearch-adapter": "^2.8.0"
   }

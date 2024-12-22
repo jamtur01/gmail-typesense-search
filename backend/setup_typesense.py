@@ -10,8 +10,8 @@ client = typesense.Client({
     'connection_timeout_seconds': 2
 })
 
-#client.collections['emails'].delete()
-#print("Deleted existing 'emails' collection.")
+client.collections['emails'].delete()
+print("Deleted existing 'emails' collection.")
 
 schema = {
     "name": "emails",

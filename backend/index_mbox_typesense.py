@@ -1,701 +1,709 @@
+"""
+Enhanced Email Indexing System with improved performance, observability, and error handling.
+"""
+
 import os
 import gc
 import json
 import time
-import typesense
-import mailbox
-import sys
 import uuid
 import logging
+import psutil
+import sys
+import mailbox
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass
 from datetime import datetime
 from email.header import decode_header
-from bs4 import BeautifulSoup
-from textblob import TextBlob
-from openai import OpenAI
-from sentence_transformers import SentenceTransformer
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
-from dotenv import load_dotenv
+from pathlib import Path
 
-# Additional imports for enrichments
+# Third-party imports
+import typesense
+import torch
+from bs4 import BeautifulSoup
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
 import spacy
 from rake_nltk import Rake
-from langdetect import detect, LangDetectException
+from gensim import corpora, models
 import pandas as pd
-from transformers import pipeline, AutoTokenizer
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import shelve
-import torch
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from dotenv import load_dotenv
 
-# Disable MPS globally
-os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+# Constants
+MAX_BODY_LENGTH = 100_000
+BATCH_SIZE = 10
+LOG_INTERVAL = 1000
+MAX_RETRIES = 5
+MAX_WORKERS = 4
 
-def initialize_local_embedding_model():
-    """Initialize the embedding model with memory management."""
-    try:
-        # Clear any existing cached data
-        gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        print("Local embedding model loaded successfully.")
-        return model
-    except Exception as e:
-        print(f"Error loading local embedding model: {e}")
-        sys.exit(1)
+@dataclass
+class EmailMetadata:
+    """Data class for email metadata."""
+    message_id: str
+    subject: str
+    sender: str
+    recipients: str
+    date_val: int
+    thread_id: str
+    labels: List[str]
 
-def initialize_pipelines():
-    """Initialize ML pipelines with safer device handling."""
-    device = -1  # Always use CPU
-    print(f"Using device: CPU (forced to avoid memory issues)")
+@dataclass
+class EmailEnrichments:
+    """Data class for email enrichments."""
+    body_vector: List[float]
+    entities: List[Dict[str, str]]
+    keywords: List[str]
+    summary: str
+
+class MLModels:
+    """Container for ML models to ensure proper initialization and cleanup."""
     
-    try:
-        gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        
-        summarizer = pipeline(
-            "summarization",
-            model="pszemraj/long-t5-tglobal-base-16384-book-summary",
-            device=device,
-            batch_size=1,
-            max_length=512,
-            framework="pt"
-        )
-        print("Summarization pipeline loaded successfully.")
-        return summarizer
-        
-    except Exception as e:
-        print(f"Error initializing pipelines: {e}")
-        sys.exit(1)
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.embedding_model: Optional[SentenceTransformer] = None
+        self.summarizer: Optional[Any] = None
+        self.nlp: Optional[Any] = None
+        self.rake: Optional[Rake] = None
 
-def setup_logging():
+    def initialize(self) -> None:
+        """Initialize all ML models with proper error handling."""
+        try:
+            self._setup_gpu_environment()
+            self._initialize_embedding_model()
+            self._initialize_nlp()
+            self._initialize_summarizer()
+            self._initialize_rake()
+        except Exception as e:
+            self.logger.error(f"Failed to initialize ML models: {e}")
+            raise
+
+    def _setup_gpu_environment(self) -> None:
+        """Configure GPU environment settings."""
+        os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _initialize_embedding_model(self) -> None:
+        """Initialize the sentence transformer model that produces 1536-dimensional vectors."""
+        try:
+            gc.collect()
+            self.embedding_model = SentenceTransformer(
+                'Alibaba-NLP/gte-Qwen2-1.5B-instruct',
+                device='cpu'
+            )
+            
+            test_embedding = self.embedding_model.encode("Test text", show_progress_bar=False)
+            vector_dim = len(test_embedding)
+            
+            if vector_dim != 1536:
+                raise ValueError(f"Model produces {vector_dim}-dimensional vectors, but 1536 dimensions are required")
+                
+            self.logger.info(f"Embedding model initialized successfully. Vector dimensions: {vector_dim}")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize embedding model: {e}")
+            raise
+
+    def _initialize_nlp(self) -> None:
+        """Initialize spaCy model."""
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            self.logger.warning("SpaCy model not found, downloading...")
+            os.system("python -m spacy download en_core_web_sm")
+            self.nlp = spacy.load("en_core_web_sm")
+
+    def _initialize_summarizer(self) -> None:
+        """Initialize the summarization pipeline."""
+        try:
+            self.summarizer = pipeline(
+                "summarization",
+                model="pszemraj/long-t5-tglobal-base-16384-book-summary",
+                device=-1,  # Force CPU
+                batch_size=1
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to initialize summarizer: {e}")
+            raise
+
+    def _initialize_rake(self) -> None:
+        """Initialize RAKE keyword extractor."""
+        self.rake = Rake()
+
+    def cleanup(self) -> None:
+        """Clean up ML models and free memory."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+class EmailProcessor:
+    """Main email processing class with improved error handling and observability."""
+
+    def __init__(self, logger: logging.Logger, ml_models: MLModels, typesense_client: typesense.Client):
+        self.logger = logger
+        self.ml_models = ml_models
+        self.typesense_client = typesense_client
+        self.checkpoint_file = Path("checkpoint.json")
+        self.processed_count = self._load_checkpoint()
+
+    def _load_checkpoint(self) -> int:
+        """Load processing checkpoint with proper error handling."""
+        try:
+            if self.checkpoint_file.exists():
+                data = json.loads(self.checkpoint_file.read_text())
+                return data.get("last_processed_index", 0)
+            return 0
+        except Exception as e:
+            self.logger.error(f"Failed to load checkpoint: {e}")
+            return 0
+
+    def _save_checkpoint(self) -> None:
+        """Save processing checkpoint with error handling."""
+        try:
+            self.checkpoint_file.write_text(
+                json.dumps({"last_processed_index": self.processed_count})
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to save checkpoint: {e}")
+
+    @staticmethod
+    def decode_header_value(value: str) -> str:
+        """Decode email header values with improved error handling."""
+        if not value:
+            return ""
+        try:
+            decoded_parts = decode_header(value)
+            return " ".join(
+                text.decode(charset or 'utf-8', errors='replace')
+                if isinstance(text, bytes) else str(text)
+                for text, charset in decoded_parts
+            )
+        except Exception:
+            return value
+
+    def extract_email_body(self, msg: mailbox.mboxMessage) -> str:
+        """Extract email body with improved HTML handling and cleanup."""
+        def process_part(part: Any) -> str:
+            if part.get_content_disposition() == 'attachment':
+                return ""
+            
+            payload = part.get_payload(decode=True)
+            if not payload:
+                return ""
+                
+            try:
+                decoded = payload.decode(errors="replace")
+                return (strip_html(decoded) 
+                       if part.get_content_type() == 'text/html'
+                       else decoded)
+            except Exception as e:
+                self.logger.error(f"Error decoding part: {e}")
+                return ""
+
+        try:
+            body_parts = []
+            if msg.is_multipart():
+                for part in msg.walk():
+                    body_parts.append(process_part(part))
+            else:
+                body_parts.append(process_part(msg))
+
+            # Clean and truncate body
+            cleaned_body = ' '.join(' '.join(body_parts).split())
+            return cleaned_body[:MAX_BODY_LENGTH]
+
+        except Exception as e:
+            self.logger.error(f"Error extracting email body: {e}")
+            return ""
+
+    def process_email(self, msg: mailbox.mboxMessage) -> Optional[Dict[str, Any]]:
+        """Process single email with comprehensive error handling."""
+        try:
+            metadata = self._extract_metadata(msg)
+            if not metadata:
+                return None
+
+            body = self.extract_email_body(msg)
+            if not body:
+                return None
+
+            enrichments = self._process_enrichments(body, metadata.message_id)
+            if not enrichments:
+                return None
+
+            return {
+                "id": metadata.message_id,
+                "subject": metadata.subject,
+                "sender": metadata.sender,
+                "recipients": metadata.recipients,
+                "date": metadata.date_val,
+                "body": body,
+                "labels": metadata.labels,
+                "thread_id": metadata.thread_id,
+                **enrichments.__dict__
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error processing email: {e}")
+            return None
+
+    def _extract_metadata(self, msg: mailbox.mboxMessage) -> Optional[EmailMetadata]:
+        """Extract and validate email metadata."""
+        try:
+            message_id = self.decode_header_value(msg.get('Message-ID', ''))
+            subject = self.decode_header_value(msg.get('Subject', ''))
+            sender = self.decode_header_value(msg.get('From', ''))
+            recipients = self.decode_header_value(msg.get('To', ''))
+            
+            if not all([subject, sender, recipients]):
+                return None
+                
+            date_str = self.decode_header_value(msg.get('Date', ''))
+            date_val = parse_date(date_str) if date_str else int(time.time())
+            
+            return EmailMetadata(
+                message_id=message_id or str(uuid.uuid4()),
+                subject=subject,
+                sender=sender,
+                recipients=recipients,
+                date_val=date_val,
+                thread_id=self.decode_header_value(msg.get('Thread-Id', '')),
+                labels=self._extract_labels(msg)
+            )
+        except Exception as e:
+            self.logger.error(f"Error extracting metadata: {e}")
+            return None
+
+    def _extract_labels(self, msg: mailbox.mboxMessage) -> List[str]:
+        """Extract email labels with proper handling."""
+        labels = self.decode_header_value(msg.get('X-Gmail-Labels', ''))
+        return [label.strip() for label in labels.split(',')] if labels else []
+
+    def _process_enrichments(self, body: str, message_id: str) -> Optional[EmailEnrichments]:
+        """Process email enrichments with comprehensive error handling."""
+        try:
+            self.logger.info(f"[{message_id}] Processing enrichments...")
+            
+            return EmailEnrichments(
+                body_vector=self._generate_embedding(body, message_id),
+                entities=self._perform_ner(body, message_id),
+                keywords=self._extract_keywords(body, message_id),
+                summary=self._generate_summary(body, message_id)
+            )
+        except Exception as e:
+            self.logger.error(f"[{message_id}] Failed to process enrichments: {e}")
+            return None
+
+    def _generate_embedding(self, text: str, message_id: str) -> List[float]:
+        """Generate embedding vector with error handling and dimension verification."""
+        try:
+            vector = self.ml_models.embedding_model.encode(
+                text, show_progress_bar=False
+            ).tolist()
+            
+            # Verify vector dimensions
+            if len(vector) != 1536:
+                raise ValueError(f"Generated vector has {len(vector)} dimensions, expected 1536")
+                
+            return vector
+        except Exception as e:
+            self.logger.error(f"[{message_id}] Failed to generate embedding: {e}")
+            # Return a zero vector of correct dimension instead of empty list
+            return [0.0] * 1536
+
+    def _perform_ner(self, text: str, message_id: str) -> List[Dict[str, str]]:
+        """Perform Named Entity Recognition with error handling."""
+        try:
+            doc = self.ml_models.nlp(text)
+            return [{"text": ent.text, "label": ent.label_} for ent in doc.ents]
+        except Exception as e:
+            self.logger.error(f"[{message_id}] Failed to perform NER: {e}")
+            return []
+
+    def _extract_keywords(self, text: str, message_id: str) -> List[str]:
+        """Extract keywords with error handling."""
+        try:
+            self.ml_models.rake.extract_keywords_from_text(text)
+            return self.ml_models.rake.get_ranked_phrases()
+        except Exception as e:
+            self.logger.error(f"[{message_id}] Failed to extract keywords: {e}")
+            return []
+
+    def _generate_summary(self, text: str, message_id: str) -> str:
+        """Generate text summary with error handling."""
+        try:
+            truncated_text = ' '.join(text.split()[:1024])
+            summary = self.ml_models.summarizer(
+                truncated_text,
+                max_length=130,
+                min_length=30,
+                do_sample=False
+            )
+            return summary[0]['summary_text']
+        except Exception as e:
+            self.logger.error(f"[{message_id}] Failed to generate summary: {e}")
+            return ""
+
+    def process_batch(self, batch: List[Dict[str, Any]]) -> None:
+        """Process batch of emails with retry mechanism."""
+        if not batch:
+            return
+
+        batch_id = str(uuid.uuid4())[:8]
+        self.logger.info(f"[Batch:{batch_id}] Processing batch of {len(batch)} documents")
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = self.typesense_client.collections['emails'].documents.import_(
+                    batch, {'action': 'upsert'}
+                )
+                self._process_batch_response(response, batch, batch_id)
+                return
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1:
+                    self.logger.error(f"[Batch:{batch_id}] Failed after {MAX_RETRIES} attempts: {e}")
+                    raise
+                wait_time = 2 ** attempt
+                self.logger.warning(f"[Batch:{batch_id}] Attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+
+    def _process_batch_response(self, response: List[Dict[str, Any]], 
+                              batch: List[Dict[str, Any]], batch_id: str) -> None:
+        """Process batch response with detailed logging."""
+        success_count = sum(1 for r in response if r.get('success', False))
+        error_count = len(response) - success_count
+        
+        self.logger.info(
+            f"[Batch:{batch_id}] Results:\n"
+            f"  Success: {success_count}/{len(batch)} ({success_count/len(batch)*100:.1f}%)\n"
+            f"  Errors: {error_count}"
+        )
+        
+        if error_count:
+            for i, result in enumerate(response):
+                if not result.get('success'):
+                    self.logger.error(
+                        f"[Batch:{batch_id}] Error indexing document {batch[i]['id']}: "
+                        f"{result.get('error', 'Unknown error')}"
+                    )
+
+def setup_logging() -> logging.Logger:
     """Setup logging with rotation and formatting."""
     logger = logging.getLogger('EmailIndexer')
     logger.setLevel(logging.INFO)
-
-    # Create a rotating file handler with compression
+    
     handler = RotatingFileHandler(
         "indexing.log",
-        maxBytes=10**7,  # 10MB
+        maxBytes=10**7,
         backupCount=5,
         encoding='utf-8'
     )
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - [%(name)s] %(message)s'
+    )
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-
+    
     return logger
 
-def load_checkpoint(logger, CHECKPOINT_FILE="checkpoint.json"):
-    """Load the last_processed_index from the checkpoint file."""
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE, "r") as f:
-            try:
-                data = json.load(f)
-                return data.get("last_processed_index", 0)
-            except json.JSONDecodeError:
-                logger.warning(f"{CHECKPOINT_FILE} is empty or malformed. Initializing to 0.")
-                return 0
-    else:
-        logger.info(f"{CHECKPOINT_FILE} does not exist. Starting from 0.")
-        return 0
-
-def save_checkpoint(processed_count, logger, CHECKPOINT_FILE="checkpoint.json"):
-    """Save the last_processed_index to the checkpoint file."""
-    try:
-        with open(CHECKPOINT_FILE, "w") as f:
-            json.dump({"last_processed_index": processed_count}, f)
-        logger.info(f"Checkpoint saved at index {processed_count}.")
-    except Exception as e:
-        logger.error(f"Failed to save checkpoint: {e}")
-
-def parse_date(date_str):
-    """Parse the email date string into a Unix timestamp."""
-    if not date_str:
-        return int(time.time())
-    for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%d %b %Y %H:%M:%S %z"):
+def parse_date(date_str: str) -> int:
+    """Parse date string to Unix timestamp with error handling."""
+    formats = [
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%d %b %Y %H:%M:%S %z"
+    ]
+    
+    for fmt in formats:
         try:
-            dt = datetime.strptime(date_str.strip(), fmt)
-            return int(dt.timestamp())
+            return int(datetime.strptime(date_str.strip(), fmt).timestamp())
         except ValueError:
             continue
     return int(time.time())
 
-def validate_message_id(message_id, subject, logger):
-    """Validate that the message_id is not empty and follows a standard format.
-       Assign a unique ID if invalid.
-    """
-    if not message_id:
-        new_id = str(uuid.uuid4())
-        logger.warning(f"Email without message_id found. Assigning unique ID. Email subject: {subject}")
-        return new_id
-    if not isinstance(message_id, str):
-        new_id = str(uuid.uuid4())
-        logger.warning(f"Invalid message_id type: {type(message_id)}. Assigning unique ID. Email subject: {subject}")
-        return new_id
-    if not message_id.startswith("<") or not message_id.endswith(">"):
-        new_id = str(uuid.uuid4())
-        logger.warning(f"Malformed message_id: {message_id}. Assigning unique ID. Email subject: {subject}")
-        return new_id
-    return message_id
-
-def extract_labels(msg):
-    """Extract labels from the email message."""
-    labels = msg.get('X-Gmail-Labels', '')
-    if labels:
-        labels = decode_header_value(labels)
-    else:
-        labels = []
-    if isinstance(labels, str):
-        labels = [label.strip() for label in labels.split(',')]
-    return labels
-
-def extract_thread_id(msg):
-    """Extract thread ID from the email message."""
-    thread_id = msg.get('Thread-Id', '')
-    if thread_id:
-        thread_id = decode_header_value(thread_id)
-    else:
-        thread_id = ''
-    return thread_id
-
-def generate_embedding(text, logger, model):
-    """Generate an embedding vector for the given text using a local model."""
+def strip_html(html_content: str) -> str:
+    """Strip HTML tags and clean text with improved handling."""
     try:
-        embedding = model.encode(text, show_progress_bar=False)
-        return embedding.tolist()  # Ensure it's serializable for Typesense
-    except Exception as e:
-        logger.error(f"Failed to generate embedding locally: {e}")
-        return []
-
-def perform_ner(text, logger, nlp):
-    """Perform Named Entity Recognition on the given text."""
-    try:
-        doc = nlp(text)
-        entities = [{"text": ent.text, "label": ent.label_} for ent in doc.ents]
-        return entities
-    except Exception as e:
-        logger.error(f"Failed to perform NER: {e}")
-        return []
-
-def extract_keywords(text, rake):
-    """Extract keywords from the given text using RAKE."""
-    rake.extract_keywords_from_text(text)
-    keywords = rake.get_ranked_phrases()
-    return keywords
-
-def perform_topic_modeling(texts, num_topics=10):
-    """Perform Topic Modeling on a list of texts using Gensim's LDA."""
-    from gensim import corpora, models
-    import gensim
-
-    # Tokenize and preprocess
-    tokenized_texts = [text.lower().split() for text in texts]
-
-    # Create a dictionary and corpus
-    dictionary = corpora.Dictionary(tokenized_texts)
-    corpus = [dictionary.doc2bow(text) for text in tokenized_texts]
-
-    # Build the LDA model
-    lda_model = models.LdaModel(corpus, num_topics=num_topics, id2word=dictionary, passes=15)
-
-    topics = lda_model.print_topics(num_topics=num_topics)
-    return topics
-
-def summarize_text(text, summarizer, logger, max_length=130, min_length=30):
-    """Summarize text with proper truncation."""
-    try:
-        # Truncate input text to avoid memory issues
-        text = ' '.join(text.split()[:1024])
-        summary = summarizer(text, max_length=max_length, min_length=min_length, 
-                           do_sample=False, batch_size=1)
-        return summary[0]['summary_text']
-    except Exception as e:
-        logger.error(f"Failed to summarize text: {e}")
-        return ""
-
-def analyze_temporal_patterns(dates):
-    """Analyze temporal patterns in email dates."""
-    df = pd.DataFrame(dates, columns=['timestamp'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-    df['hour'] = df['timestamp'].dt.hour
-    hourly_counts = df['hour'].value_counts().sort_index().to_dict()
-    return hourly_counts
-
-def highlight_keywords(text, keywords):
-    """Highlight keywords in the text."""
-    highlighted_text = text
-    for keyword in keywords:
-        highlighted_text = highlighted_text.replace(keyword, f"**{keyword}**")
-    return highlighted_text
-
-def process_enrichments(body, message_id, summarizer, logger, model, nlp, rake):
-    """Process enrichments in chunks with error handling."""
-    enrichments = {}
-    
-    logger.info(f"[{message_id}] Starting enrichment processing...")
-    
-    try:
-        logger.info(f"[{message_id}] Generating embedding vector...")
-        enrichments['body_vector'] = generate_embedding(body, logger, model)
-        logger.info(f"[{message_id}] Embedding vector generated successfully")
-    except Exception as e:
-        logger.error(f"[{message_id}] Failed to generate embedding: {e}")
-        enrichments['body_vector'] = []
-
-    try:
-        logger.info(f"[{message_id}] Performing Named Entity Recognition...")
-        enrichments['entities'] = perform_ner(body, logger, nlp)
-        logger.info(f"[{message_id}] NER complete. Found {len(enrichments['entities'])} entities")
-    except Exception as e:
-        logger.error(f"[{message_id}] Failed to perform NER: {e}")
-        enrichments['entities'] = []
-
-    try:
-        logger.info(f"[{message_id}] Extracting keywords...")
-        enrichments['keywords'] = extract_keywords(body, rake)
-        logger.info(f"[{message_id}] Keyword extraction complete. Found {len(enrichments['keywords'])} keywords")
-    except Exception as e:
-        logger.error(f"[{message_id}] Failed to extract keywords: {e}")
-        enrichments['keywords'] = []
-
-    # Handle longer text operations
-    if len(body) > 10000:
-        logger.info(f"[{message_id}] Text exceeds 10000 characters, truncating for summary...")
-        body_summary = body[:10000]
-    else:
-        body_summary = body
-
-    try:
-        logger.info(f"[{message_id}] Generating text summary...")
-        enrichments['summary'] = summarize_text(body_summary, summarizer, logger)
-        logger.info(f"[{message_id}] Summary generation complete")
-    except Exception as e:
-        logger.error(f"[{message_id}] Failed to summarize text: {e}")
-        enrichments['summary'] = ""
-
-    logger.info(f"[{message_id}] Enrichment processing complete")
-    return enrichments
-
-def process_email(msg, summarizer, logger, model, nlp, rake):
-    """Process email with memory management."""
-    message_id = decode_header_value(msg.get('Message-ID', ''))
-    if not message_id:
-        message_id = str(uuid.uuid4())
-    
-    try:
-        logger.info(f"[{message_id}] Starting email processing...")
-        result = process_email_inner(msg, message_id, summarizer, logger, model, nlp, rake)
+        soup = BeautifulSoup(html_content, 'html.parser')
+        for element in soup(['script', 'style']):
+            element.decompose()
         
-        # Force garbage collection
-        gc.collect()
-        
-        if result:
-            logger.info(f"[{message_id}] Successfully processed email")
-        else:
-            logger.warning(f"[{message_id}] Email processing resulted in no output")
-            
-        return result
-        
+        text = soup.get_text(separator=' ')
+        return ' '.join(text.split())
     except Exception as e:
-        logger.error(f"[{message_id}] Error processing email: {e}")
-        return None
+        logging.error(f"Error stripping HTML: {e}")
+        return html_content
 
-def process_email_inner(msg, message_id, summarizer, logger, model, nlp, rake):
-    """Inner email processing with chunked operations."""
-    try:
-        # Extract basic email metadata
-        logger.info(f"[{message_id}] Extracting email metadata...")
-        subject = decode_header_value(msg.get('Subject', ''))
-        sender = decode_header_value(msg.get('From', ''))
-        recipients = decode_header_value(msg.get('To', ''))
-        date_str = decode_header_value(msg.get('Date', ''))
-        date_val = parse_date(date_str) if date_str else int(time.time())
+class TopicAnalyzer:
+    """Handles topic modeling and temporal analysis."""
+    
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.texts: List[str] = []
+        self.dates: List[int] = []
+        self.message_ids: List[str] = []
 
-        # Log extracted metadata
-        logger.info(f"[{message_id}] Processing email - Subject: {subject}, From: {sender}")
+    def add_document(self, text: str, date: int, message_id: str) -> None:
+        """Add a document for analysis."""
+        self.texts.append(text)
+        self.dates.append(date)
+        self.message_ids.append(message_id)
 
-        # Validate fields
-        message_id = validate_message_id(message_id, subject, logger)
-        if not all([subject, sender, recipients]):
-            logger.warning(f"[{message_id}] Missing required fields. Skipping.")
-            return None
-
-        # Extract email body
-        logger.info(f"[{message_id}] Extracting email body...")
-        body = extract_email_body(msg, logger)
-        if not body:
-            logger.warning(f"[{message_id}] Empty body. Skipping.")
-            return None
-        logger.info(f"[{message_id}] Successfully extracted body (length: {len(body)} characters)")
-
-        # Process enrichments
-        logger.info(f"[{message_id}] Processing enrichments...")
-        enrichments = process_enrichments(body, message_id, summarizer, logger, model, nlp, rake)
-        logger.info(f"[{message_id}] Enrichments processing complete")
-
-        # Prepare document
-        logger.info(f"[{message_id}] Preparing document for indexing...")
-        doc = {
-            "id": message_id,
-            "subject": subject,
-            "sender": sender,
-            "recipients": recipients,
-            "date": date_val,
-            "body": body,
-            "labels": extract_labels(msg),
-            "thread_id": extract_thread_id(msg),
-            **enrichments
-        }
-        logger.info(f"[{message_id}] Document preparation complete")
-
-        return doc
-
-    except Exception as e:
-        logger.error(f"[{message_id}] Failed to process email: {e}")
-        return None
-
-def import_documents_with_retries(batch, typesense_client, logger, max_retries=5):
-    """
-    Import documents to Typesense with a retry mechanism and detailed logging.
-    Implements exponential backoff.
-    """
-    batch_id = str(uuid.uuid4())[:8]  # Short UUID for batch identification
-    attempt = 0
-    while attempt < max_retries:
+    def perform_topic_modeling(self, num_topics: int = 10) -> List[Tuple[int, str]]:
+        """Perform topic modeling with error handling."""
         try:
-            # Log batch attempt
-            logger.info(f"[Batch:{batch_id}] Attempting to index batch of {len(batch)} documents (attempt {attempt + 1}/{max_retries})")
+            self.logger.info("Starting topic modeling analysis...")
             
-            # Import the batch
-            response = typesense_client.collections['emails'].documents.import_(
-                batch, 
-                {'action': 'upsert'}
+            # Tokenize and preprocess
+            tokenized_texts = [text.lower().split() for text in self.texts]
+            
+            # Create dictionary and corpus
+            dictionary = corpora.Dictionary(tokenized_texts)
+            corpus = [dictionary.doc2bow(text) for text in tokenized_texts]
+            
+            # Build LDA model
+            lda_model = models.LdaModel(
+                corpus=corpus,
+                id2word=dictionary,
+                num_topics=num_topics,
+                passes=15,
+                random_state=42
             )
             
-            # Process and log the results
-            success_count = 0
-            error_count = 0
-            error_details = []
-            
-            # Analyze each document result
-            for i, result in enumerate(response):
-                doc_id = batch[i].get('id', 'unknown')
-                subject = batch[i].get('subject', 'unknown')
-                
-                if result.get('success', False):
-                    success_count += 1
-                    logger.info(f"[{doc_id}] Successfully indexed - Subject: {subject}")
-                else:
-                    error_count += 1
-                    error = result.get('error', 'Unknown error')
-                    error_details.append(f"Document ID {doc_id} ({subject}): {error}")
-                    logger.error(f"[{doc_id}] Failed to index - Subject: {subject}, Error: {error}")
-            
-            # Log detailed summary
-            logger.info(
-                f"[Batch:{batch_id}] Processing complete:\n"
-                f"  - Successfully indexed: {success_count}\n"
-                f"  - Failed to index: {error_count}\n"
-                f"  - Total processed: {len(batch)}\n"
-                f"  - Success rate: {(success_count/len(batch))*100:.2f}%"
-            )
-            
-            # If there were errors, log them in detail
-            if error_details:
-                logger.error(
-                    f"[Batch:{batch_id}] Detailed error report:\n" + 
-                    "\n".join(f"  - {error}" for error in error_details)
-                )
-            
-            return response
+            topics = lda_model.show_topics(num_topics=num_topics)
+            self.logger.info(f"Successfully identified {len(topics)} topics")
+            return topics
             
         except Exception as e:
-            attempt += 1
-            wait_time = 2 ** attempt
+            self.logger.error(f"Error in topic modeling: {e}")
+            return []
+
+    def analyze_temporal_patterns(self) -> Dict[int, int]:
+        """Analyze temporal patterns in email dates."""
+        try:
+            self.logger.info("Starting temporal analysis...")
             
-            # Log the failure with more context
-            logger.error(
-                f"[Batch:{batch_id}] Import failed (Attempt {attempt}/{max_retries}):\n"
-                f"  - Error: {str(e)}\n"
-                f"  - Batch size: {len(batch)}\n"
-                f"  - Waiting {wait_time} seconds before retry..."
-            )
+            df = pd.DataFrame({'timestamp': self.dates})
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+            df['hour'] = df['timestamp'].dt.hour
             
-            # If this is the last attempt, log more details
-            if attempt == max_retries:
-                logger.critical(
-                    f"[Batch:{batch_id}] Maximum retry attempts reached. Details:\n"
-                    f"  - Last error: {str(e)}\n"
-                    f"  - Batch size: {len(batch)}\n"
-                    f"  - First document ID: {batch[0].get('id', 'unknown')}\n"
-                    f"  - First document subject: {batch[0].get('subject', 'unknown')}"
-                )
-                sys.exit(1)
-                
-            time.sleep(wait_time)
+            patterns = df['hour'].value_counts().sort_index().to_dict()
+            self.logger.info("Temporal analysis complete")
+            return patterns
+            
+        except Exception as e:
+            self.logger.error(f"Error in temporal analysis: {e}")
+            return {}
+
+class EmailIndexer:
+    """Main class for email indexing process."""
     
-    # This should never be reached due to the sys.exit(1) above
-    # but including for completeness
-    logger.critical(f"[Batch:{batch_id}] Failed to import after {max_retries} attempts. Exiting.")
-    sys.exit(1)
+    def __init__(self, mbox_path: str):
+        self.mbox_path = Path(mbox_path)
+        self.logger = setup_logging()
+        self.ml_models = MLModels(self.logger)
+        self.topic_analyzer = TopicAnalyzer(self.logger)
+        self.typesense_client = self._initialize_typesense()
+        self.email_processor = None  # Initialize in run()
 
-def decode_header_value(value):
-    """Decode email header values into readable strings."""
-    if not value:
-        return ""
-    decoded_parts = decode_header(value)
-    decoded_str = ""
-    for text, charset in decoded_parts:
-        if isinstance(text, bytes):
-            try:
-                decoded_str += text.decode(charset or 'utf-8', errors='replace')
-            except LookupError:
-                decoded_str += text.decode('utf-8', errors='replace')
-        else:
-            decoded_str += text
-    return decoded_str
+    def _initialize_typesense(self) -> typesense.Client:
+        """Initialize Typesense client with retry logic."""
+        api_key = os.environ.get('TYPESENSE_API_KEY', 'orion123')
+        return typesense.Client({
+            'nodes': [{
+                'host': 'localhost',
+                'port': '8108',
+                'protocol': 'http'
+            }],
+            'api_key': api_key,
+            'connection_timeout_seconds': 5,
+            'retry_interval_seconds': 0.1
+        })
 
-def strip_html(html_content):
-    """Strip HTML tags and extract text using BeautifulSoup."""
-    soup = BeautifulSoup(html_content, 'html.parser')
-    for script_or_style in soup(['script', 'style']):
-        script_or_style.decompose()
-    text = soup.get_text(separator=' ')
-    text = ' '.join(text.split())
-    return text
-
-def extract_email_body(msg, logger):
-    """Extract email body with proper cleanup."""
-    try:
-        body = []
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_disposition() == 'attachment':
-                    continue
-                
-                payload = part.get_payload(decode=True)
-                if not payload:
-                    continue
-                    
-                if part.get_content_type() == 'text/plain':
-                    body.append(payload.decode(errors="replace"))
-                elif part.get_content_type() == 'text/html':
-                    body.append(strip_html(payload.decode(errors="replace")))
-        else:
-            payload = msg.get_payload(decode=True)
-            if payload:
-                if msg.get_content_type() == 'text/plain':
-                    body.append(payload.decode(errors="replace"))
-                elif msg.get_content_type() == 'text/html':
-                    body.append(strip_html(payload.decode(errors="replace")))
+    def _validate_environment(self) -> None:
+        """Validate environment and requirements."""
+        if not self.mbox_path.exists():
+            raise FileNotFoundError(f"MBOX file not found at {self.mbox_path}")
         
-        # Join all body parts and clean up
-        combined_body = ' '.join(body)
-        
-        # Remove excessive whitespace
-        cleaned_body = ' '.join(combined_body.split())
-        
-        # Truncate if extremely long (e.g., over 100KB)
-        MAX_BODY_LENGTH = 100000
-        if len(cleaned_body) > MAX_BODY_LENGTH:
-            logger.warning(f"Email body exceeds {MAX_BODY_LENGTH} characters. Truncating...")
-            cleaned_body = cleaned_body[:MAX_BODY_LENGTH]
-        
-        return cleaned_body
-        
-    except Exception as e:
-        logger.error(f"Error extracting email body: {e}")
-        return ""
-
-def index_emails(summarizer, logger, typesense_client, model, nlp, rake):
-    """Main indexing function with improved memory management."""
-    MBOX_PATH = "../data/mbox_export.mbox"
-    CHECKPOINT_FILE = "checkpoint.json"
-    BATCH_SIZE = 100
-    LOG_INTERVAL = 1000
-
-    logger.info(f"Opening MBOX file at: {MBOX_PATH}")
-    if not os.path.exists(MBOX_PATH):
-        logger.error(f"MBOX file not found at {MBOX_PATH}. Exiting.")
-        sys.exit(1)
-
-    try:
-        mbox = mailbox.mbox(MBOX_PATH)
-    except Exception as e:
-        logger.error(f"Failed to open MBOX file: {e}. Exiting.")
-        sys.exit(1)
-
-    message_count = len(mbox)
-    logger.info(f"Found {message_count} messages in the MBOX file.")
-
-    last_processed_index = load_checkpoint(logger, CHECKPOINT_FILE)
-    logger.info(f"Last processed index from checkpoint: {last_processed_index}")
-
-    batch = []
-    processed_count = last_processed_index
-
-    start_index = last_processed_index + 1
-    logger.info(f"Resuming from message index {start_index}.")
-
-    # Topic modeling data
-    topic_texts = []
-    topic_message_ids = []
-
-    # Reduced number of workers
-    max_workers = 4
-
-    try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_email = {}
-            
-            for i, msg in enumerate(mbox, start=1):
-                if i < start_index:
-                    continue
-
-                # Submit email processing
-                future = executor.submit(
-                    process_email, msg, summarizer, logger, model, nlp, rake
-                )
-                future_to_email[future] = i
-
-                # Process completed futures
-                if len(future_to_email) >= BATCH_SIZE:
-                    process_completed_futures(
-                        future_to_email, batch, topic_texts, topic_message_ids,
-                        processed_count, message_count, BATCH_SIZE, LOG_INTERVAL,
-                        logger, typesense_client, CHECKPOINT_FILE
-                    )
-                    
-                    # Force garbage collection after batch processing
-                    gc.collect()
-
-            # Process remaining futures
-            process_completed_futures(
-                future_to_email, batch, topic_texts, topic_message_ids,
-                processed_count, message_count, BATCH_SIZE, LOG_INTERVAL,
-                logger, typesense_client, CHECKPOINT_FILE
-            )
-
-        # Process final batch
-        if batch:
-            logger.info(f"Importing final batch of {len(batch)} documents...")
-            import_documents_with_retries(batch, typesense_client, logger)
-            save_checkpoint(processed_count, logger, CHECKPOINT_FILE)
-            batch.clear()
-
-        # Perform topic modeling if enough data
-        if topic_texts:
-            perform_final_analysis(topic_texts, dates, logger)
-
-    except Exception as e:
-        logger.error(f"Error during indexing: {e}")
-        raise
-    finally:
-        # Cleanup
-        gc.collect()
-
-def process_completed_futures(future_to_email, batch, topic_texts, topic_message_ids,
-                            processed_count, message_count, BATCH_SIZE, LOG_INTERVAL,
-                            logger, typesense_client, CHECKPOINT_FILE):
-    """Process completed futures with proper error handling."""
-    for future in as_completed(future_to_email):
+        # Validate Typesense connection
         try:
-            result = future.result()
-            if result:
-                batch.append(result)
-                processed_count += 1
-                topic_texts.append(result['body'])
-                topic_message_ids.append(result['id'])
-
-                if processed_count % LOG_INTERVAL == 0:
-                    logger.info(
-                        f"Processed {processed_count}/{message_count} messages. "
-                        f"Last message ID: {result['id']}, Subject: {result['subject']}"
-                    )
-
-                if len(batch) >= BATCH_SIZE:
-                    logger.info(f"Importing batch of {len(batch)} documents...")
-                    import_documents_with_retries(batch, typesense_client, logger)
-                    save_checkpoint(processed_count, logger, CHECKPOINT_FILE)
-                    batch.clear()
-                    gc.collect()
-
+            self.typesense_client.collections['emails'].retrieve()
         except Exception as e:
-            logger.error(f"Error processing future {future_to_email[future]}: {e}")
-            processed_count += 1
-
-    future_to_email.clear()
-
-def perform_final_analysis(topic_texts, dates, logger):
-    """Perform final analysis on collected data."""
-    try:
-        # Topic Modeling
-        logger.info("Performing Topic Modeling...")
-        topics = perform_topic_modeling(topic_texts, num_topics=10)
-        logger.info("Discovered Topics:")
-        for topic in topics:
-            logger.info(topic)
-
-        # Temporal Analysis
-        if dates:
-            logger.info("Performing Temporal Analysis...")
-            temporal_patterns = analyze_temporal_patterns(dates)
-            logger.info(f"Temporal Patterns: {temporal_patterns}")
-
-    except Exception as e:
-        logger.error(f"Error in final analysis: {e}")
-
-def main():
-    try:
-        gc.collect()
-        os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-        
-        logger = setup_logging()
-        logger.info("Starting email indexing process...")
-
-        try:
-            # Initialize core components
-            model = initialize_local_embedding_model()
-            
-            try:
-                nlp = spacy.load("en_core_web_sm")
-            except OSError:
-                logger.error("spaCy model not found. Installing...")
-                os.system("python -m spacy download en_core_web_sm")
-                nlp = spacy.load("en_core_web_sm")
-            
-            rake = Rake()
-            summarizer = initialize_pipelines()
-
-            API_KEY = os.environ.get('TYPESENSE_API_KEY', 'orion123')  # Default to orion123
-            typesense_client = typesense.Client({
-                'nodes': [{
-                    'host': 'localhost',
-                    'port': '8108',
-                    'protocol': 'http'
-                }],
-                'api_key': API_KEY,
-                'connection_timeout_seconds': 5
-            })
-
-            index_emails(
-                summarizer, logger, typesense_client, model, nlp, rake
-            )
-
-        except Exception as e:
-            logger.error(f"Initialization error: {e}")
+            self.logger.error(f"Failed to connect to Typesense: {e}")
             raise
 
+    def _get_memory_usage(self) -> str:
+        """Get current memory usage information."""
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        return f"Memory RSS: {memory_info.rss / 1024 / 1024:.2f}MB, VMS: {memory_info.vms / 1024 / 1024:.2f}MB"
+
+    def process_emails(self) -> None:
+        """Process emails with improved batch handling and observability."""
+        try:
+            self.logger.info(f"Opening mbox file at {self.mbox_path}")
+            self.logger.info(f"Initial memory usage - {self._get_memory_usage()}")
+            
+            start_time = time.time()
+            try:
+                mbox = mailbox.mbox(str(self.mbox_path))
+                load_time = time.time() - start_time
+                self.logger.info(f"Successfully opened mbox file in {load_time:.2f} seconds")
+            except Exception as e:
+                self.logger.error(f"Failed to open mbox file: {e}")
+                raise
+            
+            self.logger.info(f"Memory usage after opening mbox - {self._get_memory_usage()}")
+            
+            try:
+                message_count = len(mbox)
+                self.logger.info(f"Successfully counted {message_count} messages in mbox")
+            except Exception as e:
+                self.logger.error(f"Failed to count messages in mbox: {e}")
+                raise
+                
+            self.logger.info(f"Memory usage after counting messages - {self._get_memory_usage()}")
+            self.logger.info(f"Starting to process {message_count} messages from {self.mbox_path}")
+            
+            batch: List[Dict[str, Any]] = []
+            
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_to_email = {}
+                
+                for i, msg in enumerate(mbox, start=1):
+                    if i <= self.email_processor.processed_count:
+                        continue
+                        
+                    future = executor.submit(self.email_processor.process_email, msg)
+                    future_to_email[future] = i
+                    
+                    if len(future_to_email) >= BATCH_SIZE:
+                        self._process_completed_futures(
+                            future_to_email, batch, message_count
+                        )
+                
+                # Process remaining futures
+                self._process_completed_futures(future_to_email, batch, message_count)
+                
+                # Process final batch
+                if batch:
+                    self.email_processor.process_batch(batch)
+                    self.email_processor._save_checkpoint()
+            
+            # Perform final analysis
+            self._perform_final_analysis()
+            
+        except Exception as e:
+            self.logger.error(f"Error processing emails: {e}")
+            raise
+        finally:
+            self.ml_models.cleanup()
+
+    def _process_completed_futures(
+        self,
+        future_to_email: Dict[Any, int],
+        batch: List[Dict[str, Any]],
+        message_count: int
+    ) -> None:
+        """Process completed futures with proper error handling."""
+        for future in as_completed(future_to_email):
+            try:
+                result = future.result()
+                if result:
+                    batch.append(result)
+                    self.email_processor.processed_count += 1
+                    self.topic_analyzer.add_document(
+                        result['body'],
+                        result['date'],
+                        result['id']
+                    )
+                    
+                    if len(batch) >= BATCH_SIZE:
+                        self.email_processor.process_batch(batch)
+                        self.email_processor._save_checkpoint()
+                        batch.clear()
+                        gc.collect()
+                    
+                    if self.email_processor.processed_count % LOG_INTERVAL == 0:
+                        self._log_progress(message_count)
+                        
+            except Exception as e:
+                self.logger.error(f"Error processing future {future_to_email[future]}: {e}")
+                self.email_processor.processed_count += 1
+            
+        future_to_email.clear()
+
+    def _log_progress(self, message_count: int) -> None:
+        """Log processing progress with detailed metrics."""
+        progress = (self.email_processor.processed_count / message_count) * 100
+        self.logger.info(
+            f"Progress: {self.email_processor.processed_count}/{message_count} "
+            f"messages ({progress:.1f}%)"
+        )
+
+    def _perform_final_analysis(self) -> None:
+        """Perform final analysis with proper error handling."""
+        try:
+            if self.topic_analyzer.texts:
+                self.logger.info("Performing final analysis...")
+                
+                # Topic modeling
+                topics = self.topic_analyzer.perform_topic_modeling()
+                if topics:
+                    self.logger.info("Top topics identified:")
+                    for topic_id, topic in topics:
+                        self.logger.info(f"Topic {topic_id}: {topic}")
+                
+                # Temporal analysis
+                patterns = self.topic_analyzer.analyze_temporal_patterns()
+                if patterns:
+                    self.logger.info("Temporal patterns identified:")
+                    for hour, count in patterns.items():
+                        self.logger.info(f"Hour {hour}: {count} emails")
+                        
+        except Exception as e:
+            self.logger.error(f"Error in final analysis: {e}")
+
+    def run(self) -> None:
+        """Main execution method with proper initialization and cleanup."""
+        try:
+            self.logger.info("Starting email indexing process...")
+            
+            # Initialize environment
+            self._validate_environment()
+            
+            # Initialize ML models
+            self.ml_models.initialize()
+            
+            # Initialize email processor
+            self.email_processor = EmailProcessor(
+                self.logger,
+                self.ml_models,
+                self.typesense_client
+            )
+            
+            # Process emails
+            self.process_emails()
+            
+            self.logger.info("Email indexing process completed successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Fatal error in indexing process: {e}")
+            raise
+        finally:
+            self.ml_models.cleanup()
+            gc.collect()
+
+def main():
+    """Main entry point with proper error handling."""
+    try:
+        load_dotenv()
+        indexer = EmailIndexer("../data/mbox_export.mbox")
+        indexer.run()
     except Exception as e:
         print(f"Fatal error: {e}")
         sys.exit(1)
-    finally:
-        logger.info("Cleaning up...")
-        gc.collect()
-        logger.info("Process complete.")
 
 if __name__ == "__main__":
     main()

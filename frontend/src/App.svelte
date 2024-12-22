@@ -2,7 +2,18 @@
 <script>
   import { onMount } from 'svelte';
   import instantsearch from 'instantsearch.js';
-  import { searchBox, hits, configure, pagination } from 'instantsearch.js/es/widgets';
+  import {
+    searchBox,
+    hits,
+    configure,
+    pagination,
+    refinementList,
+    clearRefinements,
+    stats,
+    sortBy,
+    hitsPerPage,
+    rangeSlider
+  } from 'instantsearch.js/es/widgets';
   import TypesenseInstantSearchAdapter from 'typesense-instantsearch-adapter';
 
   // State Variables
@@ -104,6 +115,7 @@
     });
 
     searchInstance.addWidgets([
+      // Search Box
       searchBox({
         container: '#searchbox',
         showSubmit: false,
@@ -133,7 +145,122 @@
           }
         }
       }),
-      
+
+      // Clear Refinements
+      clearRefinements({
+        container: '#clear-refinements',
+        templates: {
+          resetLabel: 'Clear All Filters'
+        },
+        cssClasses: {
+          reset: 'clear-filters-button'
+        }
+      }),
+
+      // Stats
+      stats({
+        container: '#stats',
+        templates: {
+          body: `
+            <div class="stats-container">
+              <span>{{#helpers.formatNumber}}{{nbHits}}{{/helpers.formatNumber}} results found</span>
+              <span>in {{processingTimeMS}}ms</span>
+            </div>
+          `
+        },
+        cssClasses: {
+          root: 'stats'
+        }
+      }),
+
+      // Refinement Lists
+      refinementList({
+        container: '#refinement-sender',
+        attribute: 'sender',
+        searchable: true,
+        searchablePlaceholder: 'Search senders',
+        showMore: true,
+        limit: 5,
+        templates: {
+          header: '<h4>Sender</h4>'
+        }
+      }),
+      refinementList({
+        container: '#refinement-recipients',
+        attribute: 'recipients',
+        searchable: true,
+        searchablePlaceholder: 'Search recipients',
+        showMore: true,
+        limit: 5,
+        templates: {
+          header: '<h4>Recipients</h4>'
+        }
+      }),
+      refinementList({
+        container: '#refinement-intent',
+        attribute: 'intent',
+        searchable: true,
+        searchablePlaceholder: 'Search intents',
+        showMore: true,
+        limit: 5,
+        templates: {
+          header: '<h4>Intent</h4>'
+        }
+      }),
+      refinementList({
+        container: '#refinement-labels',
+        attribute: 'labels',
+        searchable: true,
+        searchablePlaceholder: 'Search labels',
+        showMore: true,
+        limit: 5,
+        templates: {
+          header: '<h4>Labels</h4>'
+        }
+      }),
+
+      // Range Slider for Date
+      rangeSlider({
+        container: '#range-slider-date',
+        attribute: 'date',
+        tooltips: {
+          format(rawValue) {
+            const date = new Date(rawValue * 1000);
+            return date.toLocaleDateString();
+          }
+        },
+        templates: {
+          header: '<h4>Date</h4>'
+        }
+      }),
+
+      // Hits Per Page
+      hitsPerPage({
+        container: '#hits-per-page',
+        items: [
+          { label: '10 hits per page', value: 10, default: true },
+          { label: '20 hits per page', value: 20 },
+          { label: '50 hits per page', value: 50 }
+        ],
+        cssClasses: {
+          select: 'hits-per-page-select'
+        }
+      }),
+
+      // Sort By
+      sortBy({
+        container: '#sort-by',
+        items: [
+          { label: 'Most Recent', value: `${collectionName}_desc` },
+          { label: 'Oldest', value: `${collectionName}_asc` },
+          { label: 'Relevance', value: `${collectionName}` }
+        ],
+        cssClasses: {
+          select: 'sort-by-select'
+        }
+      }),
+
+      // Hits
       hits({
         container: '#hits',
         templates: {
@@ -169,6 +296,7 @@
         }
       }),
 
+      // Pagination
       pagination({
         container: '#pagination',
         padding: 2,
@@ -181,6 +309,7 @@
         }
       }),
 
+      // Hits Per Page Configuration
       configure({
         hitsPerPage: 10
       })
@@ -293,15 +422,25 @@
     margin: 2rem auto;
     padding: 0 1rem;
     flex: 1;
+    display: flex;
+    gap: 2rem;
+  }
+
+  /* Sidebar Styles */
+  .sidebar {
+    width: 250px;
+    background-color: white;
+    border-radius: 0.5rem;
+    padding: 1rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    height: fit-content;
+    position: sticky;
+    top: 2rem;
   }
 
   /* Search Container Styles */
   .search-container {
-    background-color: white;
-    border-radius: 0.5rem;
-    padding: 1.5rem;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-    margin-bottom: 1.5rem;
+    flex: 1;
   }
 
   .search-controls {
@@ -309,6 +448,7 @@
     gap: 1rem;
     align-items: center;
     flex-wrap: wrap;
+    margin-bottom: 1rem;
   }
 
   .search-box {
@@ -376,10 +516,83 @@
     background-color: #2563eb;
   }
 
+  /* Sidebar Widgets */
+  .sidebar-widget {
+    margin-bottom: 1.5rem;
+  }
+
+  .sidebar-widget h4 {
+    margin-bottom: 0.5rem;
+    font-size: 1rem;
+    color: #111827;
+  }
+
+  /* Clear Refinements Button */
+  .clear-filters-button {
+    padding: 0.5rem 1rem;
+    background-color: #ef4444;
+    color: white;
+    border: none;
+    border-radius: 0.375rem;
+    cursor: pointer;
+    font-size: 0.875rem;
+    transition: background-color 0.2s;
+  }
+
+  .clear-filters-button:hover {
+    background-color: #dc2626;
+  }
+
+  /* Stats Styles */
+  .stats-container {
+    display: flex;
+    gap: 1rem;
+    font-size: 0.875rem;
+    color: #6b7280;
+  }
+
+  /* Hits Per Page Select */
+  .hits-per-page-select {
+    padding: 0.5rem;
+    border: 1px solid #d1d5db;
+    border-radius: 0.375rem;
+    background-color: white;
+    cursor: pointer;
+    font-size: 0.875rem;
+    transition: border-color 0.2s;
+  }
+
+  .hits-per-page-select:focus {
+    outline: none;
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+  }
+
+  /* Sort By Select */
+  .sort-by-select {
+    padding: 0.5rem;
+    border: 1px solid #d1d5db;
+    border-radius: 0.375rem;
+    background-color: white;
+    cursor: pointer;
+    font-size: 0.875rem;
+    transition: border-color 0.2s;
+  }
+
+  .sort-by-select:focus {
+    outline: none;
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+  }
+
   /* Results Styles */
   .result-card {
     padding: 1.5rem;
     border-bottom: 1px solid #e5e7eb;
+    background-color: white;
+    border-radius: 0.375rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
   }
 
   .result-card:last-child {
@@ -387,8 +600,8 @@
   }
 
   .result-subject {
-    font-size: 1.125rem;
-    font-weight: 500;
+    font-size: 1.25rem;
+    font-weight: 600;
     color: #111827;
     margin: 0 0 0.5rem 0;
   }
@@ -454,6 +667,13 @@
     border-color: #e5e7eb;
     color: #9ca3af;
     cursor: not-allowed;
+  }
+
+  /* Hits Per Page and Sort By Container */
+  .controls {
+    display: flex;
+    gap: 1rem;
+    align-items: center;
   }
 
   /* Help Modal Styles */
@@ -594,6 +814,15 @@
   }
 
   /* Responsive Styles */
+  @media (max-width: 1024px) {
+    .sidebar {
+      display: none;
+    }
+    .main-content {
+      flex-direction: column;
+    }
+  }
+
   @media (max-width: 640px) {
     .search-controls {
       flex-direction: column;
@@ -607,6 +836,16 @@
     .search-button {
       width: 100%;
       justify-content: center;
+    }
+
+    .controls {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .hits-per-page-select,
+    .sort-by-select {
+      width: 100%;
     }
   }
 </style>
@@ -622,6 +861,17 @@
   </header>
 
   <main class="main-content">
+    <!-- Sidebar for Filters -->
+    <aside class="sidebar">
+      <div id="clear-refinements" class="sidebar-widget"></div>
+      <div id="stats" class="sidebar-widget"></div>
+      <div id="refinement-sender" class="sidebar-widget"></div>
+      <div id="refinement-recipients" class="sidebar-widget"></div>
+      <div id="refinement-intent" class="sidebar-widget"></div>
+      <div id="refinement-labels" class="sidebar-widget"></div>
+      <div id="range-slider-date" class="sidebar-widget"></div>
+    </aside>
+
     <div class="search-container">
       <div class="search-controls">
         <div class="search-box" on:input={handleInput}>
@@ -653,6 +903,11 @@
         </button>
       </div>
 
+      <div class="controls">
+        <div id="hits-per-page" class="sidebar-widget"></div>
+        <div id="sort-by" class="sidebar-widget"></div>
+      </div>
+
       <div class="search-examples">
         <h3>Search Examples - {vectorMode ? 'Vector Mode' : 'Normal Mode'}</h3>
         <div class="example-list">
@@ -664,10 +919,10 @@
           {/each}
         </div>
       </div>
-    </div>
 
-    <div id="hits"></div>
-    <div id="pagination"></div>
+      <div id="hits"></div>
+      <div id="pagination"></div>
+    </div>
   </main>
 </div>
 
