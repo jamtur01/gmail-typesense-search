@@ -54,7 +54,7 @@
   // Typesense Configuration
   const apiKey = 'orion123';
   const typesenseHost = 'localhost'; 
-  const collectionName = 'emails';
+  const collectionName = 'emails'; // Primary collection
 
   let searchInstance;
   let query = '';
@@ -98,11 +98,11 @@
     const searchClient = typesenseInstantsearchAdapter.searchClient;
 
     searchInstance = instantsearch({
-      indexName: collectionName,
+      indexName: collectionName, // 'emails'
       searchClient,
       searchFunction(helper) {
-        const query = helper.state.query;
-        if (query === '') {
+        const currentQuery = helper.state.query;
+        if (currentQuery === '') {
           document.querySelector('#hits').innerHTML = '<div class="no-results">Enter a search query to see results</div>';
           document.querySelector('#pagination').innerHTML = '';
           return;
@@ -200,7 +200,7 @@
         container: '#refinement-intent',
         attribute: 'intent',
         searchable: true,
-        searchablePlaceholder: 'Search intents',
+        searchablePlaceholder: 'Search intent',
         showMore: true,
         limit: 5,
         templates: {
@@ -251,9 +251,9 @@
       sortBy({
         container: '#sort-by',
         items: [
-          { label: 'Most Recent', value: `${collectionName}_desc` },
-          { label: 'Oldest', value: `${collectionName}_asc` },
-          { label: 'Relevance', value: `${collectionName}` }
+          { label: 'Relevance', value: `${collectionName}` },         // Default sorting by relevance
+          { label: 'Most Recent', value: `${collectionName}_desc` }, // Sorted by date descending
+          { label: 'Oldest', value: `${collectionName}_asc` }        // Sorted by date ascending
         ],
         cssClasses: {
           select: 'sort-by-select'
@@ -265,34 +265,45 @@
         container: '#hits',
         templates: {
           empty: `<div class="no-results">No results found. Try a different query.</div>`,
-          item(hit) {
-            const subject = hit.subject || 'No Subject';
-            const sender = hit.sender || 'Unknown Sender';
-            const date = hit.date ? new Date(hit.date * 1000).toLocaleString() : 'Unknown Date';
-            let snippet = '';
-
-            if (hit._highlightResult && hit._highlightResult.body) {
-              snippet = typeof hit._highlightResult.body.value === 'string'
-                ? hit._highlightResult.body.value
-                : 'No snippet available';
-            } else if (hit.body) {
-              snippet = hit.body.slice(0, 200) + '...';
-            } else {
-              snippet = 'No content available';
-            }
-
-            return `
+          item(hit, { html, components }) {
+            // Using standard JavaScript templating instead of Svelte's syntax
+            return html`
               <div class="result-card">
-                <h3 class="result-subject">${subject}</h3>
+                <h3 class="result-subject">
+                  ${components.Highlight({ attribute: 'subject', hit })}
+                </h3>
                 <div class="result-meta">
-                  <span>${sender}</span>
-                  <span class="meta-separator">•</span>
-                  <span>${date}</span>
+                  <span class="meta-item"><strong>Sender:</strong> ${hit.sender}</span>
+                  <span class="meta-separator">|</span>
+                  <span class="meta-item"><strong>Date:</strong> ${new Date(hit.date * 1000).toLocaleString()}</span>
                 </div>
-                <div class="result-snippet">${snippet}</div>
+                <div class="result-snippet">
+                  ${components.Highlight({ attribute: 'body', hit })}
+                </div>
+                ${hit.labels && hit.labels.length > 0
+                  ? `<div class="result-labels"><strong>Labels:</strong> ${hit.labels.map(label => `<span class="label-item">${label}</span>`).join(' ')}</div>`
+                  : ''}
+                ${hit.keywords && hit.keywords.length > 0
+                  ? `<div class="result-keywords"><strong>Keywords:</strong> ${hit.keywords.map(keyword => `<span class="keyword-item">${keyword}</span>`).join(' ')}</div>`
+                  : ''}
+                ${hit.intent && hit.intent.length > 0
+                  ? `<div class="result-intent"><strong>Intent:</strong> ${hit.intent.map(intent => `<span class="intent-item">${intent}</span>`).join(' ')}</div>`
+                  : ''}
+                ${hit.entities && hit.entities.length > 0
+                  ? `<div class="result-entities"><strong>Entities:</strong> ${hit.entities.map(entity => `<span class="entity-item">${entity}</span>`).join(' ')}</div>`
+                  : ''}
               </div>
             `;
-          }
+          },
+        },
+        cssClasses: {
+          root: 'ais-Hits',
+          emptyRoot: 'ais-Hits-empty',
+          list: 'ais-Hits-list',
+          item: 'ais-Hits-item',
+          bannerRoot: 'ais-Hits-banner',
+          bannerImage: 'ais-Hits-banner-image',
+          bannerLink: 'ais-Hits-banner-link',
         }
       }),
 
@@ -351,7 +362,8 @@
   }
 
   function handleInput(event) {
-    showSuggestions = event.target.value.length > 0;
+    query = event.target.value;
+    showSuggestions = query.length > 0;
   }
 
   function triggerSearch() {
@@ -421,8 +433,8 @@
 
   /* Main Content Styles */
   .main-content {
-    max-width: 1200px;
-    margin: 2rem auto;
+    width: 100%;
+    margin: 2rem 0;
     padding: 0 1.5rem;
     flex: 1;
     display: flex;
@@ -439,6 +451,9 @@
     height: fit-content;
     position: sticky;
     top: 2rem;
+    /* Move sidebar to the far left */
+    margin-right: 2rem;
+    flex-shrink: 0;
   }
 
   /* Search Container Styles */
@@ -469,6 +484,8 @@
     font-size: 1rem;
     background-color: #ffffff;
     transition: border-color 0.2s, box-shadow 0.2s;
+    word-wrap: break-word;
+    word-break: break-word;
   }
 
   .search-input:focus {
@@ -617,6 +634,8 @@
     margin-bottom: 1rem;
     box-shadow: 0 2px 4px rgba(0,0,0,0.02);
     transition: transform 0.2s, box-shadow 0.2s;
+    word-wrap: break-word;
+    word-break: break-word;
   }
 
   .result-card:hover {
@@ -633,6 +652,8 @@
     font-weight: 600;
     color: #111827;
     margin: 0 0 0.5rem 0;
+    word-wrap: break-word;
+    word-break: break-word;
   }
 
   .result-meta {
@@ -642,6 +663,12 @@
     color: #6b7280;
     font-size: 0.875rem;
     margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+  }
+
+  .meta-item {
+    display: flex;
+    align-items: center;
   }
 
   .meta-separator {
@@ -652,6 +679,42 @@
     color: #4b5563;
     font-size: 0.875rem;
     line-height: 1.6;
+    margin-bottom: 0.75rem;
+    word-wrap: break-word;
+    word-break: break-word;
+  }
+
+  .result-labels,
+  .result-keywords,
+  .result-intent,
+  .result-entities {
+    margin-bottom: 0.5rem;
+  }
+
+  .result-labels strong,
+  .result-keywords strong,
+  .result-intent strong,
+  .result-entities strong {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-size: 0.9rem;
+    color: #111827;
+  }
+
+  .label-item,
+  .keyword-item,
+  .intent-item,
+  .entity-item {
+    display: inline-block;
+    background-color: #e5e7eb;
+    color: #111827;
+    padding: 0.2rem 0.5rem;
+    border-radius: 0.25rem;
+    font-size: 0.8rem;
+    margin-right: 0.25rem;
+    margin-bottom: 0.25rem;
+    word-wrap: break-word;
+    word-break: break-word;
   }
 
   /* Pagination Styles */
@@ -945,6 +1008,13 @@
       transform: scale(1);
     }
   }
+
+  /* Highlight Styles */
+  mark.ais-Highlight-highlighted {
+    background-color: #fde68a; /* Light yellow background for highlights */
+    padding: 0.2rem;
+    border-radius: 0.2rem;
+  }
 </style>
 
 <div class="app-container">
@@ -971,7 +1041,7 @@
 
     <div class="search-container">
       <div class="search-controls">
-        <div class="search-box" on:input={handleInput}>
+        <div class="search-box">
           <div id="searchbox"></div>
           {#if showSuggestions && query && query.length > 0}
             <div class="suggestions-container">

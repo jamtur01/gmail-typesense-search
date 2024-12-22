@@ -1,0 +1,64 @@
+/* src/styles.css */
+body {
+  font-family: 'Roboto', sans-serif;
+  background-color: #f0f2f5;
+  margin: 0;
+  padding: 0;
+}
+
+code {
+  background-color: #e0e0e0;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+/* Optional: Add scrollbar styling for better UX */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #888;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+/* Custom Overrides for InstantSearch Widgets */
+.ais-Hits-item {
+  background-color: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 16px;
+  transition: box-shadow 0.3s;
+}
+
+.ais-Hits-item:hover {
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+.ais-Highlight-highlighted {
+  background-color: yellow;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.ais-RefinementList-labelText {
+  font-weight: bold;
+  color: #333;
+}
+
+.ais-RefinementList-count {
+  background-color: #1976d2;
+  color: #fff;
+  border-radius: 12px;
+  padding: 2px 8px;
+  font-size: 0.75rem;
+}
+

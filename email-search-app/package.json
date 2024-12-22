@@ -1,0 +1,28 @@
+{
+  "name": "email-search-app",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.0",
+    "@mui/icons-material": "^5.16.12",
+    "@mui/material": "^5.16.12",
+    "axios": "^1.7.9",
+    "date-fns": "^2.30.0",
+    "instantsearch.css": "^8.5.1",
+    "lodash": "^4.17.21",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-instantsearch-dom": "^6.40.4",
+    "typesense-instantsearch-adapter": "^2.8.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^3.1.0",
+    "vite": "^4.3.9"
+  }
+}
