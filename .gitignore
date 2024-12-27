@@ -3,6 +3,7 @@ venv/
 __pycache__/
 *.pyc
 .env
+*.log.?
 credentials.json
 .DS_Store
 data

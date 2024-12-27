@@ -1,42 +1,49 @@
 """
-Enhanced Email Indexing System with improved performance, observability, and error handling.
+Optimized Email Indexing System using Weaviate v4.
+Enhanced for processing 450K+ emails with improved performance, observability, and error handling.
+Replaced FAISS and Typesense with Weaviate's built-in vector storage and search capabilities.
+Utilizes Python's `email`, `email.utils`, and `mailbox` for parsing, SentenceTransformer for embeddings, and RAKE for keyword extraction.
 """
 
 import os
 import gc
-import json
+import orjson
 import time
 import uuid
 import logging
 import psutil
+import mmap
 import sys
+import email
 import mailbox
-from typing import Dict, List, Optional, Any, Tuple
+import tempfile
+import atexit
+
+from typing import Dict, List, Optional, Any, Generator, Tuple, Union
 from dataclasses import dataclass
 from datetime import datetime
-from email.header import decode_header
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from logging.handlers import RotatingFileHandler
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
 from pathlib import Path
+import asyncio
+from functools import lru_cache
 
 # Third-party imports
-import typesense
+import weaviate
+from weaviate.classes.config import Configure, Property, DataType
 import torch
 from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
-from transformers import pipeline
 import spacy
 from rake_nltk import Rake
-from gensim import corpora, models
-import pandas as pd
 from dotenv import load_dotenv
 
 # Constants
 MAX_BODY_LENGTH = 100_000
-BATCH_SIZE = 10
+BATCH_SIZE = 100
 LOG_INTERVAL = 1000
 MAX_RETRIES = 5
-MAX_WORKERS = 4
+MAX_WORKERS = os.cpu_count() or 4
 
 @dataclass
 class EmailMetadata:
@@ -55,15 +62,15 @@ class EmailEnrichments:
     body_vector: List[float]
     entities: List[Dict[str, str]]
     keywords: List[str]
-    summary: str
 
 class MLModels:
     """Container for ML models to ensure proper initialization and cleanup."""
     
     def __init__(self, logger: logging.Logger):
         self.logger = logger
+        self.temp_dirs = []
+        atexit.register(self.cleanup_temp_directories)
         self.embedding_model: Optional[SentenceTransformer] = None
-        self.summarizer: Optional[Any] = None
         self.nlp: Optional[Any] = None
         self.rake: Optional[Rake] = None
 
@@ -73,7 +80,6 @@ class MLModels:
             self._setup_gpu_environment()
             self._initialize_embedding_model()
             self._initialize_nlp()
-            self._initialize_summarizer()
             self._initialize_rake()
         except Exception as e:
             self.logger.error(f"Failed to initialize ML models: {e}")
@@ -82,16 +88,30 @@ class MLModels:
     def _setup_gpu_environment(self) -> None:
         """Configure GPU environment settings."""
         os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-        if torch.cuda.is_available():
+        if torch.backends.mps.is_available():
+            self.logger.info("MPS (Metal Performance Shaders) is available. Using GPU for embeddings.")
+        elif torch.cuda.is_available():
             torch.cuda.empty_cache()
+            self.logger.info("CUDA is available. Using GPU for embeddings.")
+        else:
+            self.logger.warning("No GPU available. Falling back to CPU for embeddings.")
 
     def _initialize_embedding_model(self) -> None:
         """Initialize the sentence transformer model that produces 1536-dimensional vectors."""
         try:
+            os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+            
             gc.collect()
+            if torch.backends.mps.is_available():
+                device = 'mps'
+            elif torch.cuda.is_available():
+                device = 'cuda'
+            else:
+                device = 'cpu'
+
             self.embedding_model = SentenceTransformer(
                 'Alibaba-NLP/gte-Qwen2-1.5B-instruct',
-                device='cpu'
+                device=device
             )
             
             test_embedding = self.embedding_model.encode("Test text", show_progress_bar=False)
@@ -99,51 +119,132 @@ class MLModels:
             
             if vector_dim != 1536:
                 raise ValueError(f"Model produces {vector_dim}-dimensional vectors, but 1536 dimensions are required")
-                
+            
             self.logger.info(f"Embedding model initialized successfully. Vector dimensions: {vector_dim}")
         except Exception as e:
             self.logger.error(f"Failed to initialize embedding model: {e}")
             raise
 
+
     def _initialize_nlp(self) -> None:
         """Initialize spaCy model."""
         try:
             self.nlp = spacy.load("en_core_web_sm")
+            self.logger.info("spaCy model loaded successfully.")
         except OSError:
             self.logger.warning("SpaCy model not found, downloading...")
             os.system("python -m spacy download en_core_web_sm")
             self.nlp = spacy.load("en_core_web_sm")
-
-    def _initialize_summarizer(self) -> None:
-        """Initialize the summarization pipeline."""
-        try:
-            self.summarizer = pipeline(
-                "summarization",
-                model="pszemraj/long-t5-tglobal-base-16384-book-summary",
-                device=-1,  # Force CPU
-                batch_size=1
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to initialize summarizer: {e}")
-            raise
+            self.logger.info("spaCy model downloaded and loaded successfully.")
 
     def _initialize_rake(self) -> None:
         """Initialize RAKE keyword extractor."""
         self.rake = Rake()
+        self.logger.info("RAKE keyword extractor initialized successfully.")
+
+    def create_temp_directory(self) -> str:
+        temp_dir = tempfile.mkdtemp()
+        self.temp_dirs.append(temp_dir)
+        return temp_dir
+
+    def cleanup_temp_directories(self) -> None:
+        for temp_dir in self.temp_dirs:
+            try:
+                os.rmdir(temp_dir)
+                self.logger.debug(f"Cleaned up temporary directory: {temp_dir}")
+            except Exception as e:
+                self.logger.warning(f"Failed to clean up temporary directory: {temp_dir}. Error: {e}")
 
     def cleanup(self) -> None:
         """Clean up ML models and free memory."""
         gc.collect()
+        atexit.register(MLModels.cleanup_temp_directories)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        self.logger.info("ML models cleaned up and memory freed.")
+
+class WeaviateIndexer:
+    """Handles Weaviate client connection, schema creation, and object insertion."""
+    
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.client = None
+
+    def connect(self) -> None:
+        """Establish connection to Weaviate."""
+        try:
+            self.client = weaviate.connect_to_local()
+            if not self.client.is_ready():
+                raise ConnectionError("Weaviate instance is not ready.")
+            self.logger.info("Connected to Weaviate successfully.")
+        except Exception as e:
+            self.logger.error(f"Failed to connect to Weaviate: {e}")
+            raise
+
+    def insert_object(self, email_obj: Dict[str, Any]) -> Optional[str]:
+        """Insert a single email object into Weaviate."""
+        try:
+            collection = self.client.collections.get("Email")
+            uuid = collection.data.insert(
+                properties={
+                    "message_id": email_obj["message_id"],
+                    "subject": email_obj["subject"],
+                    "sender": email_obj["sender"],
+                    "recipients": email_obj["recipients"],
+                    "date_val": datetime.utcfromtimestamp(email_obj["date_val"]).isoformat() + "Z",
+                    "thread_id": email_obj["thread_id"],
+                    "labels": email_obj["labels"],
+                    "body": email_obj["body"],
+                    "entities": email_obj["entities"],
+                    "keywords": email_obj["keywords"],
+                },
+                vector=email_obj["body_vector"]  # Assuming 'body_vector' is the main vector
+            )
+            return uuid
+        except Exception as e:
+            self.logger.error(f"Failed to insert object: {e}")
+            return None
+
+    def insert_objects_batch(self, email_objs: List[Dict[str, Any]]) -> None:
+        """Insert multiple email objects into Weaviate in batches."""
+        try:
+            collection = self.client.collections.get("Email")
+            for email_obj in email_objs:
+                try:
+                    collection.data.insert(
+                        properties={
+                            "message_id": email_obj["message_id"],
+                            "subject": email_obj["subject"],
+                            "sender": email_obj["sender"],
+                            "recipients": email_obj["recipients"],
+                            "date_val": datetime.utcfromtimestamp(email_obj["date_val"]).isoformat() + "Z",
+                            "thread_id": email_obj["thread_id"],
+                            "labels": email_obj["labels"],
+                            "body": email_obj["body"],
+                            "entities": email_obj["entities"],
+                            "keywords": email_obj["keywords"],
+                        },
+                        vector=email_obj["body_vector"]  # Assuming 'body_vector' is the main vector
+                    )
+                except Exception as e:
+                    self.logger.error(f"Failed to insert object with message_id {email_obj['message_id']}: {e}")
+        except Exception as e:
+            self.logger.error(f"Failed during batch insertion: {e}")
+            raise
+
+    def close_connection(self) -> None:
+        """Close the Weaviate client connection."""
+        if self.client:
+            self.client.close()
+            self.logger.info("Weaviate client connection closed.")
 
 class EmailProcessor:
     """Main email processing class with improved error handling and observability."""
 
-    def __init__(self, logger: logging.Logger, ml_models: MLModels, typesense_client: typesense.Client):
+    def __init__(self, logger: logging.Logger, ml_models: MLModels, weaviate_indexer: WeaviateIndexer):
         self.logger = logger
         self.ml_models = ml_models
-        self.typesense_client = typesense_client
+        self.weaviate_indexer = weaviate_indexer
         self.checkpoint_file = Path("checkpoint.json")
         self.processed_count = self._load_checkpoint()
 
@@ -151,8 +252,11 @@ class EmailProcessor:
         """Load processing checkpoint with proper error handling."""
         try:
             if self.checkpoint_file.exists():
-                data = json.loads(self.checkpoint_file.read_text())
-                return data.get("last_processed_index", 0)
+                data = orjson.loads(self.checkpoint_file.read_text())
+                last_processed = data.get("last_processed_index", 0)
+                self.logger.info(f"Loaded checkpoint: last_processed_index = {last_processed}")
+                return last_processed
+            self.logger.info("No checkpoint found. Starting from the beginning.")
             return 0
         except Exception as e:
             self.logger.error(f"Failed to load checkpoint: {e}")
@@ -161,63 +265,157 @@ class EmailProcessor:
     def _save_checkpoint(self) -> None:
         """Save processing checkpoint with error handling."""
         try:
-            self.checkpoint_file.write_text(
-                json.dumps({"last_processed_index": self.processed_count})
-            )
+            with open(self.checkpoint_file, 'wb') as f:
+                f.write(orjson.dumps({"last_processed_index": self.processed_count}))
+            self.logger.debug(f"Checkpoint saved: last_processed_index = {self.processed_count}")
         except Exception as e:
             self.logger.error(f"Failed to save checkpoint: {e}")
 
-    @staticmethod
-    def decode_header_value(value: str) -> str:
-        """Decode email header values with improved error handling."""
-        if not value:
-            return ""
+    def parse_email(self, raw_msg: str) -> Optional[email.message.EmailMessage]:
+        """
+        Parse a raw email message into a structured object using the email library.
+        """
         try:
-            decoded_parts = decode_header(value)
-            return " ".join(
-                text.decode(charset or 'utf-8', errors='replace')
-                if isinstance(text, bytes) else str(text)
-                for text, charset in decoded_parts
-            )
-        except Exception:
-            return value
+            from email import message_from_string
+            msg = message_from_string(raw_msg)
+            return msg
+        except Exception as e:
+            # Log and handle failures
+            self.logger.error(f"Failed to parse email: {e}")
+            return None
 
-    def extract_email_body(self, msg: mailbox.mboxMessage) -> str:
-        """Extract email body with improved HTML handling and cleanup."""
-        def process_part(part: Any) -> str:
-            if part.get_content_disposition() == 'attachment':
-                return ""
+    def parse_email_address(self, email_str: str) -> Optional[str]:
+        """Parse a single email address with or without display name using `email.utils`."""
+        try:
+            parsed_address = email.utils.parseaddr(email_str)
+            if parsed_address[1]:  # Ensure address exists
+                return parsed_address[1]
+            self.logger.warning(f"Invalid email address format: {email_str}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error parsing email address '{email_str}': {e}")
+            return None
+
+    def parse_email_addresses(self, addresses: Union[str, List[str]]) -> List[str]:
+        """Parse a list of email addresses or a single address string using `email.utils`."""
+        try:
+            if isinstance(addresses, str):
+                addresses = [addr.strip() for addr in addresses.split(",")]
+
+            parsed_addresses = []
+            for addr in addresses:
+                parsed = self.parse_email_address(addr)
+                if parsed:
+                    parsed_addresses.append(parsed)
+            return parsed_addresses
+        except Exception as e:
+            self.logger.error(f"Error parsing email addresses: {e}")
+            return []
+
+    def validate_email_address(self, email_str: str) -> Optional[str]:
+        """Validate a single email address format using `email.utils.parseaddr`."""
+        try:
+            parsed = self.parse_email_address(email_str)
+            if parsed:
+                return parsed
+            self.logger.warning(f"Invalid email address: {email_str}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error validating email address '{email_str}': {e}")
+            return None
+
+    def validate_email_addresses(self, addresses: List[str]) -> Tuple[List[str], List[str]]:
+        """Validate a list of email addresses."""
+        try:
+            valid_addresses, invalid_addresses = [], []
+            for addr in addresses:
+                if self.validate_email_address(addr):
+                    valid_addresses.append(addr)
+                else:
+                    invalid_addresses.append(addr)
+            return valid_addresses, invalid_addresses
+        except Exception as e:
+            self.logger.error(f"Error validating email addresses: {e}")
+            return [], []
+
+    def extract_email_metadata(self, msg: email.message.EmailMessage) -> Optional[EmailMetadata]:
+        """Extract and validate email metadata using Python's `email` library."""
+        try:
+            # Extract headers
+            sender = self.parse_email_address(msg.get("From", ""))
+            recipients = self.parse_email_addresses(msg.get("To", ""))
+            subject = msg.get("Subject", "")
+            message_id = msg.get("Message-ID", str(uuid.uuid4()))
+            date_val = int(time.time())  # Default to current time if no date provided
             
-            payload = part.get_payload(decode=True)
-            if not payload:
-                return ""
-                
-            try:
-                decoded = payload.decode(errors="replace")
-                return (strip_html(decoded) 
-                       if part.get_content_type() == 'text/html'
-                       else decoded)
-            except Exception as e:
-                self.logger.error(f"Error decoding part: {e}")
-                return ""
+            if msg.get("Date"):
+                try:
+                    date_val = int(email.utils.parsedate_to_datetime(msg.get("Date")).timestamp())
+                except Exception as e:
+                    self.logger.warning(f"Failed to parse date header: {e}")
 
+            thread_id = msg.get("Thread-ID", "")
+            labels = msg.get("X-Gmail-Labels", "").split(",") if msg.get("X-Gmail-Labels") else []
+
+            return EmailMetadata(
+                message_id=message_id,
+                subject=subject,
+                sender=sender,
+                recipients=recipients,
+                date_val=date_val,
+                thread_id=thread_id,
+                labels=labels
+            )
+        except Exception as e:
+            self.logger.error(f"Error extracting metadata: {e}")
+            return None
+
+    def extract_email_body(self, msg: email.message.EmailMessage) -> str:
+        """Extract email body using Python's `email` library."""
         try:
-            body_parts = []
             if msg.is_multipart():
+                body_parts = []
                 for part in msg.walk():
-                    body_parts.append(process_part(part))
+                    if part.get_content_type() == "text/plain" and not part.get("Content-Disposition"):
+                        body_parts.append(part.get_payload(decode=True).decode(errors="replace"))
+                return "\n".join(body_parts)
             else:
-                body_parts.append(process_part(msg))
-
-            # Clean and truncate body
-            cleaned_body = ' '.join(' '.join(body_parts).split())
-            return cleaned_body[:MAX_BODY_LENGTH]
-
+                return msg.get_payload(decode=True).decode(errors="replace")
         except Exception as e:
             self.logger.error(f"Error extracting email body: {e}")
             return ""
 
-    def process_email(self, msg: mailbox.mboxMessage) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    @lru_cache(maxsize=10000)
+    def decode_header_value_cached(value: str) -> str:
+        """Decode email header values with caching."""
+        if not value:
+            return ""
+        try:
+            from email.header import decode_header
+            decoded_parts = decode_header(value)
+            return " ".join(
+                text.decode(charset or 'utf-8', errors='replace') if isinstance(text, bytes) else str(text)
+                for text, charset in decoded_parts
+            )
+        except Exception as e:
+            logging.error(f"Failed to decode header value: {e}")
+            return value
+
+    @staticmethod
+    def strip_html(html_content: str) -> str:
+        """Strip HTML tags and clean text with improved handling."""
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            for element in soup(['script', 'style']):
+                element.decompose()
+            text = soup.get_text(separator=' ')
+            return ' '.join(text.split())
+        except Exception as e:
+            logging.error(f"Error stripping HTML: {e}")
+            return html_content
+
+    def process_email(self, msg: Any) -> Optional[Dict[str, Any]]:
         """Process single email with comprehensive error handling."""
         try:
             metadata = self._extract_metadata(msg)
@@ -232,35 +430,40 @@ class EmailProcessor:
             if not enrichments:
                 return None
 
-            return {
-                "id": metadata.message_id,
+            email_dict = {
+                "id": metadata.message_id,  # Using message_id as UUID
+                "message_id": metadata.message_id,
                 "subject": metadata.subject,
                 "sender": metadata.sender,
                 "recipients": metadata.recipients,
-                "date": metadata.date_val,
-                "body": body,
-                "labels": metadata.labels,
+                "date_val": metadata.date_val,
                 "thread_id": metadata.thread_id,
-                **enrichments.__dict__
+                "labels": metadata.labels,
+                "body": body,
+                "entities": enrichments.entities,
+                "keywords": enrichments.keywords,
+                "body_vector": enrichments.body_vector
             }
+
+            return email_dict
 
         except Exception as e:
             self.logger.error(f"Error processing email: {e}")
             return None
 
-    def _extract_metadata(self, msg: mailbox.mboxMessage) -> Optional[EmailMetadata]:
+    def _extract_metadata(self, msg: Any) -> Optional[EmailMetadata]:
         """Extract and validate email metadata."""
         try:
-            message_id = self.decode_header_value(msg.get('Message-ID', ''))
-            subject = self.decode_header_value(msg.get('Subject', ''))
-            sender = self.decode_header_value(msg.get('From', ''))
-            recipients = self.decode_header_value(msg.get('To', ''))
+            message_id = self.decode_header_value_cached(msg.headers.get('Message-ID', ''))
+            subject = self.decode_header_value_cached(msg.headers.get('Subject', ''))
+            sender = self.decode_header_value_cached(msg.headers.get('From', ''))
+            recipients = self.decode_header_value_cached(msg.headers.get('To', ''))
             
             if not all([subject, sender, recipients]):
                 return None
                 
-            date_str = self.decode_header_value(msg.get('Date', ''))
-            date_val = parse_date(date_str) if date_str else int(time.time())
+            date_str = self.decode_header_value_cached(msg.headers.get('Date', ''))
+            date_val = self.parse_date(date_str) if date_str else int(time.time())
             
             return EmailMetadata(
                 message_id=message_id or str(uuid.uuid4()),
@@ -268,28 +471,31 @@ class EmailProcessor:
                 sender=sender,
                 recipients=recipients,
                 date_val=date_val,
-                thread_id=self.decode_header_value(msg.get('Thread-Id', '')),
+                thread_id=self.decode_header_value_cached(msg.headers.get('Thread-Id', '')),
                 labels=self._extract_labels(msg)
             )
         except Exception as e:
             self.logger.error(f"Error extracting metadata: {e}")
             return None
 
-    def _extract_labels(self, msg: mailbox.mboxMessage) -> List[str]:
+    def _extract_labels(self, msg: Any) -> List[str]:
         """Extract email labels with proper handling."""
-        labels = self.decode_header_value(msg.get('X-Gmail-Labels', ''))
+        labels = self.decode_header_value_cached(msg.headers.get('X-Gmail-Labels', ''))
         return [label.strip() for label in labels.split(',')] if labels else []
 
     def _process_enrichments(self, body: str, message_id: str) -> Optional[EmailEnrichments]:
         """Process email enrichments with comprehensive error handling."""
         try:
-            self.logger.info(f"[{message_id}] Processing enrichments...")
+            self.logger.debug(f"[{message_id}] Processing enrichments...")
+            
+            body_vector = self._generate_embedding(body, message_id)
+            entities = self._perform_ner(body, message_id)
+            keywords = self._extract_keywords(body, message_id)
             
             return EmailEnrichments(
-                body_vector=self._generate_embedding(body, message_id),
-                entities=self._perform_ner(body, message_id),
-                keywords=self._extract_keywords(body, message_id),
-                summary=self._generate_summary(body, message_id)
+                body_vector=body_vector,
+                entities=entities,
+                keywords=keywords
             )
         except Exception as e:
             self.logger.error(f"[{message_id}] Failed to process enrichments: {e}")
@@ -298,6 +504,14 @@ class EmailProcessor:
     def _generate_embedding(self, text: str, message_id: str) -> List[float]:
         """Generate embedding vector with error handling and dimension verification."""
         try:
+            # Compute hash of the email body
+            body_hash = hash(text)
+            # Check if embedding is cached
+            cached_embedding = self.embedding_cache.get(body_hash)
+            if cached_embedding:
+                self.logger.debug(f"[{message_id}] Using cached embedding.")
+                return cached_embedding
+            
             vector = self.ml_models.embedding_model.encode(
                 text, show_progress_bar=False
             ).tolist()
@@ -306,6 +520,9 @@ class EmailProcessor:
             if len(vector) != 1536:
                 raise ValueError(f"Generated vector has {len(vector)} dimensions, expected 1536")
                 
+            # Cache the embedding
+            self.embedding_cache[body_hash] = vector
+            
             return vector
         except Exception as e:
             self.logger.error(f"[{message_id}] Failed to generate embedding: {e}")
@@ -330,207 +547,108 @@ class EmailProcessor:
             self.logger.error(f"[{message_id}] Failed to extract keywords: {e}")
             return []
 
-    def _generate_summary(self, text: str, message_id: str) -> str:
-        """Generate text summary with error handling."""
-        try:
-            truncated_text = ' '.join(text.split()[:1024])
-            summary = self.ml_models.summarizer(
-                truncated_text,
-                max_length=130,
-                min_length=30,
-                do_sample=False
-            )
-            return summary[0]['summary_text']
-        except Exception as e:
-            self.logger.error(f"[{message_id}] Failed to generate summary: {e}")
-            return ""
+    # Implementing Embedding Cache (2.9.1)
+    def initialize_embedding_cache(self):
+        """Initialize a simple in-memory cache for embeddings."""
+        self.embedding_cache: Dict[int, List[float]] = {}
 
-    def process_batch(self, batch: List[Dict[str, Any]]) -> None:
-        """Process batch of emails with retry mechanism."""
-        if not batch:
-            return
-
-        batch_id = str(uuid.uuid4())[:8]
-        self.logger.info(f"[Batch:{batch_id}] Processing batch of {len(batch)} documents")
-
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = self.typesense_client.collections['emails'].documents.import_(
-                    batch, {'action': 'upsert'}
-                )
-                self._process_batch_response(response, batch, batch_id)
-                return
-            except Exception as e:
-                if attempt == MAX_RETRIES - 1:
-                    self.logger.error(f"[Batch:{batch_id}] Failed after {MAX_RETRIES} attempts: {e}")
-                    raise
-                wait_time = 2 ** attempt
-                self.logger.warning(f"[Batch:{batch_id}] Attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-
-    def _process_batch_response(self, response: List[Dict[str, Any]], 
-                              batch: List[Dict[str, Any]], batch_id: str) -> None:
-        """Process batch response with detailed logging."""
-        success_count = sum(1 for r in response if r.get('success', False))
-        error_count = len(response) - success_count
-        
-        self.logger.info(
-            f"[Batch:{batch_id}] Results:\n"
-            f"  Success: {success_count}/{len(batch)} ({success_count/len(batch)*100:.1f}%)\n"
-            f"  Errors: {error_count}"
-        )
-        
-        if error_count:
-            for i, result in enumerate(response):
-                if not result.get('success'):
-                    self.logger.error(
-                        f"[Batch:{batch_id}] Error indexing document {batch[i]['id']}: "
-                        f"{result.get('error', 'Unknown error')}"
-                    )
-
-def setup_logging() -> logging.Logger:
-    """Setup logging with rotation and formatting."""
-    logger = logging.getLogger('EmailIndexer')
-    logger.setLevel(logging.INFO)
-    
-    handler = RotatingFileHandler(
-        "indexing.log",
-        maxBytes=10**7,
-        backupCount=5,
-        encoding='utf-8'
-    )
-    
-    formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - [%(name)s] %(message)s'
-    )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    
-    return logger
-
-def parse_date(date_str: str) -> int:
-    """Parse date string to Unix timestamp with error handling."""
-    formats = [
-        "%a, %d %b %Y %H:%M:%S %z",
-        "%d %b %Y %H:%M:%S %z"
-    ]
-    
-    for fmt in formats:
-        try:
-            return int(datetime.strptime(date_str.strip(), fmt).timestamp())
-        except ValueError:
-            continue
-    return int(time.time())
-
-def strip_html(html_content: str) -> str:
-    """Strip HTML tags and clean text with improved handling."""
-    try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        for element in soup(['script', 'style']):
-            element.decompose()
-        
-        text = soup.get_text(separator=' ')
-        return ' '.join(text.split())
-    except Exception as e:
-        logging.error(f"Error stripping HTML: {e}")
-        return html_content
-
-class TopicAnalyzer:
-    """Handles topic modeling and temporal analysis."""
-    
-    def __init__(self, logger: logging.Logger):
-        self.logger = logger
-        self.texts: List[str] = []
-        self.dates: List[int] = []
-        self.message_ids: List[str] = []
-
-    def add_document(self, text: str, date: int, message_id: str) -> None:
-        """Add a document for analysis."""
-        self.texts.append(text)
-        self.dates.append(date)
-        self.message_ids.append(message_id)
-
-    def perform_topic_modeling(self, num_topics: int = 10) -> List[Tuple[int, str]]:
-        """Perform topic modeling with error handling."""
-        try:
-            self.logger.info("Starting topic modeling analysis...")
-            
-            # Tokenize and preprocess
-            tokenized_texts = [text.lower().split() for text in self.texts]
-            
-            # Create dictionary and corpus
-            dictionary = corpora.Dictionary(tokenized_texts)
-            corpus = [dictionary.doc2bow(text) for text in tokenized_texts]
-            
-            # Build LDA model
-            lda_model = models.LdaModel(
-                corpus=corpus,
-                id2word=dictionary,
-                num_topics=num_topics,
-                passes=15,
-                random_state=42
-            )
-            
-            topics = lda_model.show_topics(num_topics=num_topics)
-            self.logger.info(f"Successfully identified {len(topics)} topics")
-            return topics
-            
-        except Exception as e:
-            self.logger.error(f"Error in topic modeling: {e}")
-            return []
-
-    def analyze_temporal_patterns(self) -> Dict[int, int]:
-        """Analyze temporal patterns in email dates."""
-        try:
-            self.logger.info("Starting temporal analysis...")
-            
-            df = pd.DataFrame({'timestamp': self.dates})
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-            df['hour'] = df['timestamp'].dt.hour
-            
-            patterns = df['hour'].value_counts().sort_index().to_dict()
-            self.logger.info("Temporal analysis complete")
-            return patterns
-            
-        except Exception as e:
-            self.logger.error(f"Error in temporal analysis: {e}")
-            return {}
+    # Additional methods for embedding cache persistence can be added here
 
 class EmailIndexer:
     """Main class for email indexing process."""
     
     def __init__(self, mbox_path: str):
         self.mbox_path = Path(mbox_path)
-        self.logger = setup_logging()
+        self.logger, self.listener = self.setup_logging()
         self.ml_models = MLModels(self.logger)
-        self.topic_analyzer = TopicAnalyzer(self.logger)
-        self.typesense_client = self._initialize_typesense()
-        self.email_processor = None  # Initialize in run()
+        self.weaviate_indexer = WeaviateIndexer(self.logger)
+        self.email_processor = EmailProcessor(
+            self.logger,
+            self.ml_models,
+            self.weaviate_indexer
+        )
+        self.email_processor.initialize_embedding_cache()
 
-    def _initialize_typesense(self) -> typesense.Client:
-        """Initialize Typesense client with retry logic."""
-        api_key = os.environ.get('TYPESENSE_API_KEY', 'orion123')
-        return typesense.Client({
-            'nodes': [{
-                'host': 'localhost',
-                'port': '8108',
-                'protocol': 'http'
-            }],
-            'api_key': api_key,
-            'connection_timeout_seconds': 5,
-            'retry_interval_seconds': 0.1
-        })
+    def setup_logging(self) -> Tuple[logging.Logger, QueueListener]:
+        """Setup asynchronous logging with rotation and formatting."""
+        logger = logging.getLogger('EmailIndexer')
+        logger.setLevel(logging.INFO)
+        
+        # Use standard Queue 
+        from queue import Queue
+        log_queue = Queue()
+        
+        # Create and add handlers
+        handler = RotatingFileHandler(
+            "indexing.log",
+            maxBytes=10**7,  # 10 MB
+            backupCount=5,
+            encoding='utf-8'
+        )
+        
+        formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - [%(name)s] %(message)s'
+        )
+        handler.setFormatter(formatter)
+        
+        # Create and start queue handler
+        queue_handler = QueueHandler(log_queue)
+        logger.addHandler(queue_handler)
+        
+        # Create and start queue listener
+        listener = QueueListener(log_queue, handler)
+        listener.start()
+        
+        return logger, listener
+
+    def cleanup(self):
+        """Cleanup resources properly."""
+        try:
+            # Stop the queue listener first
+            if hasattr(self, 'listener') and self.listener:
+                try:
+                    self.listener.stop()
+                    delattr(self, 'listener')  # Remove the listener after stopping
+                except Exception as e:
+                    self.logger.error(f"Error stopping listener: {e}")
+
+            # Close all log handlers
+            if hasattr(self, 'logger') and self.logger:
+                for handler in self.logger.handlers[:]:
+                    try:
+                        handler.close()
+                        self.logger.removeHandler(handler)
+                    except Exception as e:
+                        self.logger.error(f"Error closing handler: {e}")
+            
+            # Close Weaviate connection
+            if hasattr(self, 'weaviate_indexer') and self.weaviate_indexer:
+                try:
+                    self.weaviate_indexer.close_connection()
+                except Exception as e:
+                    self.logger.error(f"Error closing Weaviate connection: {e}")
+
+            # Cleanup ML models
+            if hasattr(self, 'ml_models') and self.ml_models:
+                try:
+                    self.ml_models.cleanup()
+                except Exception as e:
+                    self.logger.error(f"Error cleaning up ML models: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {e}")
 
     def _validate_environment(self) -> None:
         """Validate environment and requirements."""
         if not self.mbox_path.exists():
             raise FileNotFoundError(f"MBOX file not found at {self.mbox_path}")
         
-        # Validate Typesense connection
+        # Validate Weaviate connection
         try:
-            self.typesense_client.collections['emails'].retrieve()
+            self.weaviate_indexer.connect()
+            self.logger.info("Successfully connected to Weaviate.")
         except Exception as e:
-            self.logger.error(f"Failed to connect to Typesense: {e}")
+            self.logger.error(f"Failed to connect or create schema in Weaviate: {e}")
             raise
 
     def _get_memory_usage(self) -> str:
@@ -539,131 +657,86 @@ class EmailIndexer:
         memory_info = process.memory_info()
         return f"Memory RSS: {memory_info.rss / 1024 / 1024:.2f}MB, VMS: {memory_info.vms / 1024 / 1024:.2f}MB"
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+
+    def __del__(self):
+        self.cleanup()
+
     def process_emails(self) -> None:
         """Process emails with improved batch handling and observability."""
         try:
             self.logger.info(f"Opening mbox file at {self.mbox_path}")
             self.logger.info(f"Initial memory usage - {self._get_memory_usage()}")
-            
-            start_time = time.time()
+
+            email_messages = []
+            mbox = None
             try:
-                mbox = mailbox.mbox(str(self.mbox_path))
-                load_time = time.time() - start_time
-                self.logger.info(f"Successfully opened mbox file in {load_time:.2f} seconds")
+                mbox = mailbox.mbox(self.mbox_path)
+                for key in mbox.keys():
+                    try:
+                        msg = mbox[key]
+                        raw_msg = msg.as_string()
+                        email_messages.append(self.email_processor.parse_email(raw_msg))
+                    except Exception as e:
+                        self.logger.error(f"Failed to parse email with key {key}: {e}")
             except Exception as e:
-                self.logger.error(f"Failed to open mbox file: {e}")
+                self.logger.error(f"Failed to read mbox file: {e}")
                 raise
-            
-            self.logger.info(f"Memory usage after opening mbox - {self._get_memory_usage()}")
-            
-            try:
-                message_count = len(mbox)
-                self.logger.info(f"Successfully counted {message_count} messages in mbox")
-            except Exception as e:
-                self.logger.error(f"Failed to count messages in mbox: {e}")
-                raise
-                
-            self.logger.info(f"Memory usage after counting messages - {self._get_memory_usage()}")
-            self.logger.info(f"Starting to process {message_count} messages from {self.mbox_path}")
-            
+            finally:
+                if mbox:
+                    mbox.close()
+
+            self.logger.info(f"Successfully read {len(email_messages)} messages from mbox file.")
+
             batch: List[Dict[str, Any]] = []
-            
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                future_to_email = {}
-                
-                for i, msg in enumerate(mbox, start=1):
-                    if i <= self.email_processor.processed_count:
-                        continue
-                        
-                    future = executor.submit(self.email_processor.process_email, msg)
-                    future_to_email[future] = i
-                    
-                    if len(future_to_email) >= BATCH_SIZE:
-                        self._process_completed_futures(
-                            future_to_email, batch, message_count
-                        )
-                
-                # Process remaining futures
-                self._process_completed_futures(future_to_email, batch, message_count)
-                
-                # Process final batch
+            start_time = time.time()
+
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(self.email_processor.process_email, msg): msg
+                    for msg in email_messages[self.email_processor.processed_count:]
+                }
+
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result:
+                        batch.append(result)
+                        self.email_processor.processed_count += 1
+
+                        if self.email_processor.processed_count % LOG_INTERVAL == 0:
+                            self._log_progress()
+
+                        if len(batch) >= BATCH_SIZE:
+                            self.weaviate_indexer.insert_objects_batch(batch)
+                            self.email_processor._save_checkpoint()
+                            self.logger.info(f"Inserted batch of {len(batch)} emails into Weaviate.")
+                            batch.clear()
+                            gc.collect()
+
                 if batch:
-                    self.email_processor.process_batch(batch)
+                    self.weaviate_indexer.insert_objects_batch(batch)
                     self.email_processor._save_checkpoint()
-            
-            # Perform final analysis
-            self._perform_final_analysis()
-            
+                    self.logger.info(f"Inserted final batch of {len(batch)} emails into Weaviate.")
+                    batch.clear()
+
+            total_time = time.time() - start_time
+            self.logger.info(f"Email processing completed in {total_time:.2f} seconds.")
+
         except Exception as e:
             self.logger.error(f"Error processing emails: {e}")
             raise
-        finally:
-            self.ml_models.cleanup()
 
-    def _process_completed_futures(
-        self,
-        future_to_email: Dict[Any, int],
-        batch: List[Dict[str, Any]],
-        message_count: int
-    ) -> None:
-        """Process completed futures with proper error handling."""
-        for future in as_completed(future_to_email):
-            try:
-                result = future.result()
-                if result:
-                    batch.append(result)
-                    self.email_processor.processed_count += 1
-                    self.topic_analyzer.add_document(
-                        result['body'],
-                        result['date'],
-                        result['id']
-                    )
-                    
-                    if len(batch) >= BATCH_SIZE:
-                        self.email_processor.process_batch(batch)
-                        self.email_processor._save_checkpoint()
-                        batch.clear()
-                        gc.collect()
-                    
-                    if self.email_processor.processed_count % LOG_INTERVAL == 0:
-                        self._log_progress(message_count)
-                        
-            except Exception as e:
-                self.logger.error(f"Error processing future {future_to_email[future]}: {e}")
-                self.email_processor.processed_count += 1
-            
-        future_to_email.clear()
-
-    def _log_progress(self, message_count: int) -> None:
+    def _log_progress(self) -> None:
         """Log processing progress with detailed metrics."""
-        progress = (self.email_processor.processed_count / message_count) * 100
+        progress = (self.email_processor.processed_count / 450_000) * 100  # Assuming total is 450K
         self.logger.info(
-            f"Progress: {self.email_processor.processed_count}/{message_count} "
+            f"Progress: {self.email_processor.processed_count}/450000 "
             f"messages ({progress:.1f}%)"
         )
-
-    def _perform_final_analysis(self) -> None:
-        """Perform final analysis with proper error handling."""
-        try:
-            if self.topic_analyzer.texts:
-                self.logger.info("Performing final analysis...")
-                
-                # Topic modeling
-                topics = self.topic_analyzer.perform_topic_modeling()
-                if topics:
-                    self.logger.info("Top topics identified:")
-                    for topic_id, topic in topics:
-                        self.logger.info(f"Topic {topic_id}: {topic}")
-                
-                # Temporal analysis
-                patterns = self.topic_analyzer.analyze_temporal_patterns()
-                if patterns:
-                    self.logger.info("Temporal patterns identified:")
-                    for hour, count in patterns.items():
-                        self.logger.info(f"Hour {hour}: {count} emails")
-                        
-        except Exception as e:
-            self.logger.error(f"Error in final analysis: {e}")
 
     def run(self) -> None:
         """Main execution method with proper initialization and cleanup."""
@@ -676,31 +749,36 @@ class EmailIndexer:
             # Initialize ML models
             self.ml_models.initialize()
             
-            # Initialize email processor
-            self.email_processor = EmailProcessor(
-                self.logger,
-                self.ml_models,
-                self.typesense_client
-            )
-            
             # Process emails
             self.process_emails()
             
-            self.logger.info("Email indexing process completed successfully")
+            self.logger.info("Email indexing process completed successfully.")
             
         except Exception as e:
             self.logger.error(f"Fatal error in indexing process: {e}")
             raise
-        finally:
-            self.ml_models.cleanup()
-            gc.collect()
+
+    @staticmethod
+    def parse_date(date_str: str) -> int:
+        """Parse date string to Unix timestamp with error handling."""
+        formats = [
+            "%a, %d %b %Y %H:%M:%S %z",
+            "%d %b %Y %H:%M:%S %z"
+        ]
+        
+        for fmt in formats:
+            try:
+                return int(datetime.strptime(date_str.strip(), fmt).timestamp())
+            except ValueError:
+                continue
+        return int(time.time())
 
 def main():
     """Main entry point with proper error handling."""
     try:
         load_dotenv()
-        indexer = EmailIndexer("../data/mbox_export.mbox")
-        indexer.run()
+        with EmailIndexer("../data/mbox_export.mbox") as indexer:
+            indexer.run()
     except Exception as e:
         print(f"Fatal error: {e}")
         sys.exit(1)

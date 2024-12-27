@@ -37,8 +37,6 @@ schema = {
         },
         {"name": "entities", "type": "object[]", "optional": True},  # Changed to object[]
         {"name": "keywords", "type": "string[]", "optional": True},
-        {"name": "summary", "type": "string", "optional": True},
-        {"name": "intent", "type": "string", "facet": True, "optional": True}
     ],
     "default_sorting_field": "date",
     "enable_nested_fields": True  # Added for object[] support
