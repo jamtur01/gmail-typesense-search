@@ -158,7 +158,7 @@ class MLModels:
     def cleanup(self) -> None:
         """Clean up ML models and free memory."""
         gc.collect()
-        atexit.register(MLModels.cleanup_temp_directories)
+        atexit.register(self.cleanup_temp_directories)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         self.logger.info("ML models cleaned up and memory freed.")
