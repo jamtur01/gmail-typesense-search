@@ -24,3 +24,4 @@ services:
       CLUSTER_HOSTNAME: 'node1'
 volumes:
   weaviate_data:
+    external: true
