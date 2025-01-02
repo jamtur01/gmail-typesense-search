@@ -13,7 +13,7 @@ services:
     - 8080:8080
     - 50051:50051
     volumes:
-    - weaviate_data:/var/lib/weaviate
+    - backend_weaviate_data:/var/lib/weaviate
     restart: on-failure:0
     environment:
       QUERY_DEFAULTS_LIMIT: 25
@@ -23,5 +23,5 @@ services:
       ENABLE_MODULES: 'text2vec-ollama,generative-ollama'
       CLUSTER_HOSTNAME: 'node1'
 volumes:
-  weaviate_data:
+  backend_weaviate_data:
     external: true
